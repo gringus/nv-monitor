@@ -628,6 +628,58 @@ static void detect_tegra_gpu_dev(void) {
     }
 }
 
+/* ── NIC ASIC temperature (ConnectX / mlx5) ─────────────────────────── */
+
+#define MAX_NIC_SENSORS 8
+
+static char nic_sensor_paths[MAX_NIC_SENSORS][128];
+static int  nic_sensor_count = 0;
+
+static void detect_nic_asic_sensors(void) {
+    DIR *dir = opendir("/sys/class/hwmon");
+    if (!dir) return;
+
+    struct dirent *ent = NULL;
+    while ((ent = readdir(dir)) && nic_sensor_count < MAX_NIC_SENSORS) {
+        if (strncmp(ent->d_name, "hwmon", 5) != 0) continue;
+
+        char name[64] = "";
+        snprintf(name, sizeof(name), "/sys/class/hwmon/%s/name", ent->d_name);
+        FILE *f = fopen(name, "r");
+        if (f) {
+            if (fgets(name, sizeof(name), f))
+                name[strcspn(name, "\n\r")] = '\0';
+            fclose(f);
+        }
+        if (strcmp(name, "mlx5") != 0) continue;
+
+        /* Verify temp1_input exists */
+        char path[192];
+        snprintf(path, sizeof(path), "/sys/class/hwmon/%s/temp1_input", ent->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        fclose(f);
+        snprintf(nic_sensor_paths[nic_sensor_count],
+                 sizeof(nic_sensor_paths[0]), "%s", path);
+        nic_sensor_count++;
+    }
+    closedir(dir);
+}
+
+/* Return hottest ASIC temperature in deg C, 0 if no sensor found */
+static int read_nic_asic_temp(void) {
+    int max_temp = 0;
+    for (int i = 0; i < nic_sensor_count; i++) {
+        FILE *f = fopen(nic_sensor_paths[i], "r");
+        if (!f) continue;
+        int millideg = 0;
+        if (fscanf(f, "%d", &millideg) == 1 && millideg / 1000 > max_temp)
+            max_temp = millideg / 1000;
+        fclose(f);
+    }
+    return max_temp;
+}
+
 static int scan_tegra_gpu_procs(GpuProc *procs, int max_procs) {
     if (!tegra_gpu_dev && !use_tegra_gpu) return 0;
     int n = 0;
@@ -1090,7 +1142,7 @@ static void log_csv_header(FILE *f) {
     fprintf(f, ",cpu_temp_c,cpu_freq_mhz");
     fprintf(f, ",mem_used_kb,mem_total_kb,mem_bufcache_kb");
     fprintf(f, ",swap_used_kb,swap_total_kb");
-    fprintf(f, ",net_rx_Bps,net_tx_Bps");
+    fprintf(f, ",net_rx_Bps,net_tx_Bps,nic_asic_temp_c");
     for (unsigned int g = 0; g < gpu_count; g++)
         fprintf(f, ",gpu%u_util_pct,gpu%u_temp_c,gpu%u_power_mw,gpu%u_clock_mhz", g, g, g, g);
     /* Windowed peaks (30-minute window) */
@@ -1127,7 +1179,8 @@ static void log_csv_row(FILE *f) {
     read_meminfo(&mi);
     fprintf(f, ",%llu,%llu,%llu", mi.app_kb, mi.total_kb, mi.bufcache_kb);
     fprintf(f, ",%llu,%llu", mi.swap_used_kb, mi.swap_total_kb);
-    fprintf(f, ",%.0f,%.0f", net_totals.rx_bytes_sec, net_totals.tx_bytes_sec);
+    fprintf(f, ",%.0f,%.0f,%d", net_totals.rx_bytes_sec, net_totals.tx_bytes_sec,
+            read_nic_asic_temp());
 
     /* GPU */
     for (unsigned int g = 0; g < gpu_count; g++) {
@@ -1428,6 +1481,13 @@ static int format_metrics(char *buf, int buflen) {
            "nv_network_transmit_bytes_per_second %.0f\n",
            net_totals.rx_bytes, net_totals.tx_bytes,
            net_totals.rx_bytes_sec, net_totals.tx_bytes_sec);
+    }
+
+    int nic_temp = read_nic_asic_temp();
+    if (nic_temp > 0) {
+        PM("# HELP nv_nic_asic_temperature_celsius NIC ASIC temperature (mlx5/ConnectX, hottest sensor)\n"
+           "# TYPE nv_nic_asic_temperature_celsius gauge\n"
+           "nv_nic_asic_temperature_celsius %d\n", nic_temp);
     }
 
     /* Disk usage per real mountpoint (skip pseudo/virtual fs) */
@@ -1893,8 +1953,20 @@ static void draw_screen(void) {
     get_loadavg(&l1, &l5, &l15);
     int right_x = cols;
     {
-        char info[128];
-        int len = snprintf(info, sizeof(info), "up %s  load %.2f %.2f %.2f", upbuf, l1, l5, l15);
+        char info[160];
+        /* System clock (to the second) when the header has room */
+        time_t now = time(NULL);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        int len = snprintf(info, sizeof(info),
+                           "%02d:%02d:%02d  up %s  load %.2f %.2f %.2f",
+                           tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec,
+                           upbuf, l1, l5, l15);
+        if (len >= cols) {
+            /* No room for the clock — drop it */
+            len = snprintf(info, sizeof(info),
+                           "up %s  load %.2f %.2f %.2f", upbuf, l1, l5, l15);
+        }
         if (len > 0 && len < cols) {
             right_x = cols - len - 1;
             mvprintw(y, right_x, "%s", info);
@@ -2121,26 +2193,48 @@ static void draw_screen(void) {
     }
 
     if (net_totals.valid) {
+        /* Sum RDMA (IB/RoCE) rates into the NET display so CX-7 NCCL traffic is visible.
+         * RDMA bypasses /proc/net/dev entirely, so without this the bar shows near-zero
+         * during inference all-reduces. */
+        double rdma_rx = 0.0, rdma_tx = 0.0;
+        if (rdma_available) {
+            for (int i = 0; i < rdma_count; i++) {
+                rdma_rx += rdma_ports[i].recv_bytes_sec;
+                rdma_tx += rdma_ports[i].xmit_bytes_sec;
+            }
+        }
+        double disp_rx = net_totals.rx_bytes_sec + rdma_rx;
+        double disp_tx = net_totals.tx_bytes_sec + rdma_tx;
+        double total_combined = disp_rx + disp_tx;
+        if (total_combined > net_scale_bytes_sec) net_scale_bytes_sec = total_combined;
+
         char rx[16], tx[16], scale[16];
         attron(A_BOLD | COLOR_PAIR(6));
-        mvprintw(y, 1, "NET");
+        mvprintw(y, 1, rdma_available ? "NET+IB" : "NET");
         attroff(A_BOLD | COLOR_PAIR(6));
         attron(COLOR_PAIR(2));
         printw("  ");
-        printw("%s", fmt_rate(net_totals.rx_bytes_sec, rx, sizeof(rx)));
+        printw("%s", fmt_rate(disp_rx, rx, sizeof(rx)));
         attroff(COLOR_PAIR(2));
         printw(" down");
         attron(COLOR_PAIR(3));
-        printw("  %s", fmt_rate(net_totals.tx_bytes_sec, tx, sizeof(tx)));
+        printw("  %s", fmt_rate(disp_tx, tx, sizeof(tx)));
         attroff(COLOR_PAIR(3));
         printw(" up");
+        int nic_temp = read_nic_asic_temp();
+        if (nic_temp > 0) {
+            int nt_color = nic_temp >= 95 ? 1 : (nic_temp >= 85 ? 3 : 8);
+            attron(COLOR_PAIR(nt_color));
+            printw("   NIC %d C", nic_temp);
+            attroff(COLOR_PAIR(nt_color));
+        }
         y++;
 
         mvprintw(y, 1, "  I/O ");
         int bw = cols - 24;
         if (bw < 10) bw = 10;
-        double rx_pct = net_scale_bytes_sec > 0 ? net_totals.rx_bytes_sec / net_scale_bytes_sec * 100.0 : 0;
-        double tx_pct = net_scale_bytes_sec > 0 ? net_totals.tx_bytes_sec / net_scale_bytes_sec * 100.0 : 0;
+        double rx_pct = net_scale_bytes_sec > 0 ? disp_rx / net_scale_bytes_sec * 100.0 : 0;
+        double tx_pct = net_scale_bytes_sec > 0 ? disp_tx / net_scale_bytes_sec * 100.0 : 0;
         if (rx_pct < 0) rx_pct = 0;
         if (tx_pct < 0) tx_pct = 0;
         if (rx_pct + tx_pct > 100.0) {
@@ -2673,6 +2767,7 @@ int main(int argc, char *argv[]) {
     /* Detect Tegra GPU sysfs (Jetson fallback) */
     detect_tegra_gpu();
     detect_tegra_gpu_dev();
+    detect_nic_asic_sensors();
     /* On Tegra/Jetson, NVML returns SUCCESS but zeros for util/temp — prefer sysfs */
     if (tegra_gpu_available)
         use_tegra_gpu = 1;
