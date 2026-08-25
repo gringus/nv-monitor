@@ -1,0 +1,31 @@
+[Unit]
+Description=nv-monitor — NVIDIA DGX System Monitor
+Documentation=https://github.com/mguikka/nv-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nv-monitor -n -p 9101
+Restart=on-failure
+RestartSec=5
+
+User=root
+Group=root
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/proc /sys
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nv-monitor
+
+[Install]
+WantedBy=multi-user.target

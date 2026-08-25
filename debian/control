@@ -1,0 +1,12 @@
+Package: nv-monitor
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: __PKG_ARCH__
+Depends: libc6 (>= 2.32), libncurses6 (>= 6.0)
+Maintainer: __MAINTAINER__
+Description: NVIDIA DGX system monitor (TUI)
+ nv-monitor is a single-file terminal system monitor for the NVIDIA
+ DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It combines CPU,
+ memory, and GPU monitoring in one ncurses TUI, with optional Prometheus
+ export and CSV logging.

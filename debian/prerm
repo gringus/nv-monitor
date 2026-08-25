@@ -1,0 +1,2 @@
+#!/bin/sh
+systemctl --no-reload disable --now nv-monitor 2>/dev/null || true

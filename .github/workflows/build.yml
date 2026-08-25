@@ -106,51 +106,69 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download arm64 artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          name: nv-monitor-linux-arm64
-          path: arm64
+          path: ${{ runner.temp }}/artifacts
 
-      - name: Download arm64 demo-load
-        uses: actions/download-artifact@v8
+      - name: Checkout for deb package
+        uses: actions/checkout@v6
         with:
-          name: demo-load-linux-arm64
-          path: arm64
-
-      - name: Download arm64-legacy artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: nv-monitor-linux-arm64-legacy
-          path: arm64-legacy
-
-      - name: Download arm64-legacy demo-load
-        uses: actions/download-artifact@v8
-        with:
-          name: demo-load-linux-arm64-legacy
-          path: arm64-legacy
-
-      - name: Download amd64 artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: nv-monitor-linux-amd64
-          path: amd64
-
-      - name: Download amd64 demo-load
-        uses: actions/download-artifact@v8
-        with:
-          name: demo-load-linux-amd64
-          path: amd64
+          fetch-depth: 1
 
       - name: Rename binaries
         run: |
-          mv arm64/nv-monitor nv-monitor-linux-arm64
-          mv arm64/demo-load demo-load-linux-arm64
-          mv arm64-legacy/nv-monitor nv-monitor-linux-arm64-legacy
-          mv arm64-legacy/demo-load demo-load-linux-arm64-legacy
-          mv amd64/nv-monitor nv-monitor-linux-amd64
-          mv amd64/demo-load demo-load-linux-amd64
+          cp $RUNNER_TEMP/artifacts/nv-monitor-linux-arm64/nv-monitor nv-monitor-linux-arm64
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-arm64/demo-load demo-load-linux-arm64
+          cp $RUNNER_TEMP/artifacts/nv-monitor-linux-arm64-legacy/nv-monitor nv-monitor-linux-arm64-legacy
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-arm64-legacy/demo-load demo-load-linux-arm64-legacy
+          cp $RUNNER_TEMP/artifacts/nv-monitor-linux-amd64/nv-monitor nv-monitor-linux-amd64
+          cp $RUNNER_TEMP/artifacts/demo-load-linux-amd64/demo-load demo-load-linux-amd64
           chmod +x nv-monitor-linux-* demo-load-linux-*
+
+      - name: Build deb package (arm64)
+        run: |
+          sudo apt-get install -y fakeroot > /dev/null 2>&1 || true
+
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          mkdir -p deb-pkg/usr/bin deb-pkg/usr/lib/systemd/system deb-pkg/DEBIAN
+          cp nv-monitor-linux-arm64 deb-pkg/usr/bin/nv-monitor
+          cp deploy/nv-monitor.service deb-pkg/usr/lib/systemd/system/
+
+          sed "s#__VERSION__#$VERSION#g;
+               s#__MAINTAINER__#$GITHUB_ACTOR#g;
+               s#__PKG_ARCH__#arm64#g" \
+            debian/control > deb-pkg/DEBIAN/control
+
+          for script in postinst prerm postrm; do
+            cp "debian/$script" deb-pkg/DEBIAN/
+            chmod +x "deb-pkg/DEBIAN/$script"
+          done
+
+          fakeroot dpkg-deb --build deb-pkg "nv-monitor_${VERSION}_arm64.deb"
+
+      - name: Build deb package (amd64)
+        run: |
+          sudo apt-get install -y fakeroot > /dev/null 2>&1 || true
+
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          mkdir -p deb-pkg/usr/bin deb-pkg/usr/lib/systemd/system deb-pkg/DEBIAN
+          cp nv-monitor-linux-amd64 deb-pkg/usr/bin/nv-monitor
+          cp deploy/nv-monitor.service deb-pkg/usr/lib/systemd/system/
+
+          sed "s/__VERSION__/$VERSION/g;
+               s/__MAINTAINER__/$GITHUB_ACTOR/g;
+               s/__PKG_ARCH__/amd64/g" \
+            debian/control > deb-pkg/DEBIAN/control
+
+          for script in postinst prerm postrm; do
+            cp "debian/$script" deb-pkg/DEBIAN/
+            chmod +x "deb-pkg/DEBIAN/$script"
+          done
+
+          fakeroot dpkg-deb --build deb-pkg "nv-monitor_${VERSION}_amd64.deb"
 
       - name: Create release
         uses: softprops/action-gh-release@v3
@@ -166,6 +184,8 @@ jobs:
             | `nv-monitor-linux-arm64-legacy` | Older aarch64 Linux (glibc 2.35+). **Jetson Orin / JetPack 5/6.** Also works on newer systems. |
             | `nv-monitor-linux-amd64` | x86_64 Linux with an NVIDIA GPU. |
             | `demo-load-linux-*` | Companion synthetic load generator for testing. Same platform rules as nv-monitor. |
+            | `nv-monitor_*_amd64.deb` | Debian/Ubuntu package for x86_64. |
+            | `nv-monitor_*_arm64.deb` | Debian/Ubuntu package for aarch64. Installs systemd service automatically. |
 
             If in doubt on arm64, pick `-legacy` — it works almost everywhere.
           files: |
@@ -175,3 +195,5 @@ jobs:
             demo-load-linux-arm64
             demo-load-linux-amd64
             demo-load-linux-arm64-legacy
+            nv-monitor_*_amd64.deb
+            nv-monitor_*_arm64.deb
