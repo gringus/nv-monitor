@@ -1634,6 +1634,13 @@ static int format_metrics(char *buf, int buflen) {
                           pNvmlDeviceGetEncoderUtilization(dev, &g->enc, &period) == NVML_SUCCESS);
             g->has_dec = (pNvmlDeviceGetDecoderUtilization &&
                           pNvmlDeviceGetDecoderUtilization(dev, &g->dec, &period) == NVML_SUCCESS);
+            /* Update windowed peaks — data is fresh here, called on every scrape */
+            if (peak_gpu_util && d < (unsigned int)gpu_count) {
+                update_windowed_peak(&peak_gpu_util[d], g->util_gpu);
+                update_windowed_peak(&peak_gpu_temp_c[d], g->temp);
+                if (g->has_power)
+                    update_windowed_peak(&peak_gpu_power_mw[d], g->power_mw / 1000.0);
+            }
             n_gpus++;
         }
     }
@@ -2825,6 +2832,8 @@ int main(int argc, char *argv[]) {
             compute_cpu_usage();
             read_net_totals();
             read_rdma_ports();
+            update_windowed_peak(&peak_cpu_pct, cpu_pct[0]);
+            update_windowed_peak(&peak_cpu_temp_c, (double)read_cpu_temp());
             if (log_fp) log_csv_row(log_fp);
             usleep(headless_interval * 1000);
         }
