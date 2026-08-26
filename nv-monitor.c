@@ -107,6 +107,7 @@ static CpuTick  *prev_ticks = NULL;  /* [max_cpus + 1] — index 0 = aggregate *
 static CpuTick  *cur_ticks = NULL;   /* [max_cpus + 1] — current frame */
 static double   *cpu_pct = NULL;     /* [max_cpus + 1] */
 static unsigned int *cpu_part = NULL; /* [max_cpus] */
+static int      *cpu_freq_mhz = NULL; /* [max_cpus + 1] — per-core frequency */
 
 /* ── GPU process info ───────────────────────────────────────────────── */
 
@@ -520,13 +521,27 @@ static int read_cpu_temp(void) {
 
 /* ── CPU frequency ──────────────────────────────────────────────────── */
 
-static int read_cpu_freq_mhz(void) {
+static void read_cpu_freqs(void) {
+    /* Aggregate frequency (cpu0) for backward compatibility */
     FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
-    if (!f) return 0;
-    int khz = 0;
-    (void)!fscanf(f, "%d", &khz);
-    fclose(f);
-    return khz / 1000;
+    if (f) {
+        int khz = 0;
+        (void)!fscanf(f, "%d", &khz);
+        fclose(f);
+        cpu_freq_mhz[0] = khz / 1000;
+    }
+    /* Per-core frequencies */
+    for (int i = 1; i <= num_cpus; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", i - 1);
+        f = fopen(path, "r");
+        if (f) {
+            int khz = 0;
+            (void)!fscanf(f, "%d", &khz);
+            fclose(f);
+            cpu_freq_mhz[i] = khz / 1000;
+        }
+    }
 }
 
 static void read_host_name(void) {
@@ -1140,6 +1155,8 @@ static void log_csv_header(FILE *f) {
     for (int i = 1; i <= num_cpus; i++)
         fprintf(f, ",cpu%d_pct", i - 1);
     fprintf(f, ",cpu_temp_c,cpu_freq_mhz");
+    for (int i = 1; i <= num_cpus; i++)
+        fprintf(f, ",cpu%d_freq_mhz", i - 1);
     fprintf(f, ",mem_used_kb,mem_total_kb,mem_bufcache_kb");
     fprintf(f, ",swap_used_kb,swap_total_kb");
     fprintf(f, ",net_rx_Bps,net_tx_Bps,nic_asic_temp_c");
@@ -1172,7 +1189,10 @@ static void log_csv_row(FILE *f) {
     for (int i = 1; i <= num_cpus; i++)
         fprintf(f, ",%.1f", cpu_pct[i]);
 
-    fprintf(f, ",%d,%d", read_cpu_temp(), read_cpu_freq_mhz());
+    read_cpu_freqs();
+    fprintf(f, ",%d,%d", read_cpu_temp(), cpu_freq_mhz[0]);
+    for (int i = 1; i <= num_cpus; i++)
+        fprintf(f, ",%d", cpu_freq_mhz[i]);
 
     /* Memory */
     MemInfo mi;
@@ -1430,9 +1450,19 @@ static int format_metrics(char *buf, int buflen) {
        "nv_cpu_temperature_celsius %d\n", read_cpu_temp());
 
     /* CPU frequency */
+    read_cpu_freqs();
     PM("# HELP nv_cpu_frequency_mhz CPU frequency\n"
        "# TYPE nv_cpu_frequency_mhz gauge\n"
-       "nv_cpu_frequency_mhz %d\n", read_cpu_freq_mhz());
+       "nv_cpu_frequency_mhz{cpu=\"overall\"} %d\n", cpu_freq_mhz[0]);
+    for (int i = 1; i <= num_cpus; i++) {
+        const char *lbl = cpu_part_label(i - 1);
+        if (lbl[0])
+            PM("nv_cpu_frequency_mhz{cpu=\"%d\",type=\"%s\"} %d\n",
+               i - 1, lbl, cpu_freq_mhz[i]);
+        else
+            PM("nv_cpu_frequency_mhz{cpu=\"%d\"} %d\n",
+               i - 1, cpu_freq_mhz[i]);
+    }
 
     /* Windowed peaks (30-minute window) */
     PM("# HELP nv_cpu_usage_peak_30m_percent Peak CPU utilization over the last 30 minutes\n"
@@ -2019,7 +2049,8 @@ static void draw_screen(void) {
 
     /* ── CPU section ────────────────────────────────────────────────── */
     int cpu_temp = read_cpu_temp();
-    int cpu_freq = read_cpu_freq_mhz();
+    read_cpu_freqs();
+    int cpu_freq = cpu_freq_mhz[0];
 
     /* Update windowed peaks */
     update_windowed_peak(&peak_cpu_pct, cpu_pct[0]);
@@ -2787,7 +2818,8 @@ int main(int argc, char *argv[]) {
     cur_ticks  = calloc(max_cpus + 1, sizeof(CpuTick));
     cpu_pct    = calloc(max_cpus + 1, sizeof(double));
     cpu_part   = calloc(max_cpus, sizeof(unsigned int));
-    if (!prev_ticks || !cur_ticks || !cpu_pct || !cpu_part) {
+    cpu_freq_mhz = calloc(max_cpus + 1, sizeof(int));
+    if (!prev_ticks || !cur_ticks || !cpu_pct || !cpu_part || !cpu_freq_mhz) {
         fprintf(stderr, "Failed to allocate CPU arrays for %d cores\n", max_cpus);
         return 1;
     }
@@ -2933,6 +2965,7 @@ int main(int argc, char *argv[]) {
     free(cur_ticks);  cur_ticks = NULL;
     free(cpu_pct);    cpu_pct = NULL;
     free(cpu_part);   cpu_part = NULL;
+    free(cpu_freq_mhz); cpu_freq_mhz = NULL;
     free(peak_gpu_util);    peak_gpu_util = NULL;
     free(peak_gpu_temp_c);  peak_gpu_temp_c = NULL;
     free(peak_gpu_power_mw); peak_gpu_power_mw = NULL;
