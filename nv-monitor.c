@@ -76,7 +76,6 @@ static int   use_tegra_gpu = 0;         /* prefer Tegra sysfs over NVML for GPU 
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define REFRESH_MS    1000
 #define MAX_THERMAL_ZONES 20
 #define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c overrides this */
 
@@ -97,7 +96,6 @@ static int      *cpu_freq_mhz = NULL; /* [max_cpus + 1] — per-core frequency *
 /* ── Globals ────────────────────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_quit = 0;
-static int delay_ms = REFRESH_MS;
 
 /* Command-line options */
 static int   prom_port = 0;  /* Prometheus metrics port (0 = not set) */
@@ -469,22 +467,15 @@ static void get_loadavg(double *l1, double *l5, double *l15) {
     if (f) { (void)!fscanf(f, "%lf %lf %lf", l1, l5, l15); fclose(f); }
 }
 
-/* ── Aggregate network throughput ───────────────────────────────────── */
+/* ── Network counters (emitted as Prometheus *_total) ───────────────── */
 
 typedef struct {
     unsigned long long rx_bytes;
     unsigned long long tx_bytes;
-    double rx_bytes_sec;
-    double tx_bytes_sec;
     int valid;
 } NetTotals;
 
 static NetTotals net_totals = {0};
-static unsigned long long net_prev_rx = 0;
-static unsigned long long net_prev_tx = 0;
-static struct timespec    net_prev_time;
-static int                net_prev_valid = 0;
-static double             net_scale_bytes_sec = 1024.0 * 1024.0; /* auto-scaling floor: 1 MiB/s */
 
 static void read_net_totals(void) {
     FILE *f = fopen("/proc/net/dev", "r");
@@ -525,42 +516,12 @@ static void read_net_totals(void) {
     }
     fclose(f);
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double dt = 0.0;
-    if (net_prev_valid) {
-        dt = (now.tv_sec - net_prev_time.tv_sec) +
-             (now.tv_nsec - net_prev_time.tv_nsec) / 1e9;
-        if (dt <= 0) dt = 1.0;
-    }
-
     net_totals.rx_bytes = rx_total;
     net_totals.tx_bytes = tx_total;
-    if (net_prev_valid) {
-        if (rx_total >= net_prev_rx)
-            net_totals.rx_bytes_sec = (double)(rx_total - net_prev_rx) / dt;
-        else
-            net_totals.rx_bytes_sec = 0;  /* counter wrapped, skip frame */
-        if (tx_total >= net_prev_tx)
-            net_totals.tx_bytes_sec = (double)(tx_total - net_prev_tx) / dt;
-        else
-            net_totals.tx_bytes_sec = 0;  /* counter wrapped, skip frame */
-    } else {
-        net_totals.rx_bytes_sec = 0;
-        net_totals.tx_bytes_sec = 0;
-    }
     net_totals.valid = 1;
-    double total_bytes_sec = net_totals.rx_bytes_sec + net_totals.tx_bytes_sec;
-    double decayed_scale = net_scale_bytes_sec * 0.95;
-    if (decayed_scale < 1024.0 * 1024.0) decayed_scale = 1024.0 * 1024.0;
-    net_scale_bytes_sec = total_bytes_sec > decayed_scale ? total_bytes_sec : decayed_scale;
-    net_prev_rx = rx_total;
-    net_prev_tx = tx_total;
-    net_prev_time = now;
-    net_prev_valid = 1;
 }
 
-/* ── RDMA types (used by CSV logging and Prometheus) ───────────────── */
+/* ── RDMA types (used by Prometheus) ───────────────── */
 
 #define MAX_RDMA_PORTS 16
 
@@ -574,8 +535,6 @@ typedef struct {
     unsigned long long xmit_pkts;
     unsigned long long recv_pkts;
     unsigned long long errors;
-    double xmit_bytes_sec;
-    double recv_bytes_sec;
 } RdmaPort;
 
 static RdmaPort rdma_ports[MAX_RDMA_PORTS];
@@ -583,11 +542,6 @@ static int       rdma_count = 0;
 static int       rdma_available = 0;
 
 /* ── RDMA / InfiniBand monitoring ───────────────────────────────────── */
-
-static unsigned long long rdma_prev_xmit[MAX_RDMA_PORTS];
-static unsigned long long rdma_prev_recv[MAX_RDMA_PORTS];
-static struct timespec    rdma_prev_time;
-static int                rdma_prev_valid = 0;
 
 static unsigned long long read_sysfs_ull(const char *path) {
     FILE *f = fopen(path, "r");
@@ -609,15 +563,6 @@ static void read_sysfs_str(const char *path, char *buf, int len) {
 static void read_rdma_ports(void) {
     DIR *ib_dir = opendir("/sys/class/infiniband");
     if (!ib_dir) { rdma_available = 0; rdma_count = 0; return; }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double dt = 0;
-    if (rdma_prev_valid) {
-        dt = (now.tv_sec - rdma_prev_time.tv_sec) +
-             (now.tv_nsec - rdma_prev_time.tv_nsec) / 1e9;
-        if (dt <= 0) dt = 1;
-    }
 
     rdma_available = 1;
     int idx = 0;
@@ -673,30 +618,11 @@ static void read_rdma_ports(void) {
                 r->errors += read_sysfs_ull(path);
             }
 
-            /* Rate calculation */
-            if (rdma_prev_valid && idx < rdma_count) {
-                if (r->xmit_bytes >= rdma_prev_xmit[idx])
-                    r->xmit_bytes_sec = (double)(r->xmit_bytes - rdma_prev_xmit[idx]) / dt;
-                else
-                    r->xmit_bytes_sec = 0;  /* counter wrapped, skip frame */
-                if (r->recv_bytes >= rdma_prev_recv[idx])
-                    r->recv_bytes_sec = (double)(r->recv_bytes - rdma_prev_recv[idx]) / dt;
-                else
-                    r->recv_bytes_sec = 0;  /* counter wrapped, skip frame */
-            } else {
-                r->xmit_bytes_sec = 0;
-                r->recv_bytes_sec = 0;
-            }
-
-            rdma_prev_xmit[idx] = r->xmit_bytes;
-            rdma_prev_recv[idx] = r->recv_bytes;
             idx++;
         }
     }
     closedir(ib_dir);
     rdma_count = idx;
-    rdma_prev_time = now;
-    rdma_prev_valid = 1;
 }
 
 /* ── Prometheus metrics exporter ────────────────────────────────────── */
@@ -783,7 +709,8 @@ static int format_metrics(char *buf, int buflen) {
        "nv_load_average{interval=\"5m\"} %.2f\n"
        "nv_load_average{interval=\"15m\"} %.2f\n", l1, l5, l15);
 
-    /* CPU usage */
+    /* CPU usage — delta since the previous scrape */
+    compute_cpu_usage();
     PM("# HELP nv_cpu_usage_percent CPU utilization\n"
        "# TYPE nv_cpu_usage_percent gauge\n");
     for (int i = 1; i <= num_cpus; i++) {
@@ -849,21 +776,15 @@ static int format_metrics(char *buf, int buflen) {
            mi.swap_total_kb * 1024ULL, mi.swap_used_kb * 1024ULL);
     }
 
+    read_net_totals();
     if (net_totals.valid) {
         PM("# HELP nv_network_receive_bytes_total Total bytes received across all non-loopback interfaces\n"
            "# TYPE nv_network_receive_bytes_total counter\n"
            "nv_network_receive_bytes_total %llu\n"
            "# HELP nv_network_transmit_bytes_total Total bytes transmitted across all non-loopback interfaces\n"
            "# TYPE nv_network_transmit_bytes_total counter\n"
-           "nv_network_transmit_bytes_total %llu\n"
-           "# HELP nv_network_receive_bytes_per_second Aggregate receive throughput across all non-loopback interfaces\n"
-           "# TYPE nv_network_receive_bytes_per_second gauge\n"
-           "nv_network_receive_bytes_per_second %.0f\n"
-           "# HELP nv_network_transmit_bytes_per_second Aggregate transmit throughput across all non-loopback interfaces\n"
-           "# TYPE nv_network_transmit_bytes_per_second gauge\n"
-           "nv_network_transmit_bytes_per_second %.0f\n",
-           net_totals.rx_bytes, net_totals.tx_bytes,
-           net_totals.rx_bytes_sec, net_totals.tx_bytes_sec);
+           "nv_network_transmit_bytes_total %llu\n",
+           net_totals.rx_bytes, net_totals.tx_bytes);
     }
 
     int nic_temp = read_nic_asic_temp();
@@ -1085,6 +1006,7 @@ static int format_metrics(char *buf, int buflen) {
     }
 
     /* RDMA / InfiniBand */
+    read_rdma_ports();
     if (rdma_available && rdma_count > 0) {
         PM("# HELP nv_rdma_info RDMA port information\n"
            "# TYPE nv_rdma_info gauge\n");
@@ -1122,18 +1044,6 @@ static int format_metrics(char *buf, int buflen) {
         for (int i = 0; i < rdma_count; i++)
             PM("nv_rdma_errors_total{device=\"%s\",port=\"%d\"} %llu\n",
                rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].errors);
-
-        PM("# HELP nv_rdma_xmit_bytes_per_second Transmit throughput\n"
-           "# TYPE nv_rdma_xmit_bytes_per_second gauge\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_xmit_bytes_per_second{device=\"%s\",port=\"%d\"} %.0f\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].xmit_bytes_sec);
-
-        PM("# HELP nv_rdma_recv_bytes_per_second Receive throughput\n"
-           "# TYPE nv_rdma_recv_bytes_per_second gauge\n");
-        for (int i = 0; i < rdma_count; i++)
-            PM("nv_rdma_recv_bytes_per_second{device=\"%s\",port=\"%d\"} %.0f\n",
-               rdma_ports[i].device, rdma_ports[i].port, rdma_ports[i].recv_bytes_sec);
     }
 
 pm_done:
@@ -1283,17 +1193,15 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  -p PORT   Expose Prometheus metrics on PORT (required)\n"
         "  -t TOKEN  Require Bearer token for /metrics (or NV_MONITOR_TOKEN env)\n"
-        "  -r MS     Collection interval in milliseconds (default: 1000)\n"
         "  -v        Show version\n"
         "  -h        Show this help\n"
         "\n"
         "Examples:\n"
         "  %s -p 9101                    Prometheus exporter on :9101\n"
-        "  %s -p 9101 -r 2000            Collect every 2s\n"
         "\n"
         "Copyright (c) 2026 Paul Gresham Advisory LLC\n"
         "https://github.com/wentbackward/nv-monitor\n",
-        prog, prog, prog);
+        prog, prog);
 }
 
 /* ── Main ───────────────────────────────────────────────────────────── */
@@ -1304,11 +1212,10 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, on_signal);
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:r:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:vh")) != -1) {
         switch (opt) {
         case 'p': prom_port = atoi(optarg); break;
         case 't': prom_token = optarg; break;
-        case 'r': delay_ms = atoi(optarg); break;
         case 'v': printf("nv-monitor %s\n", VERSION); return 0;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -1323,7 +1230,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: -p <port> is required\n");
         return 1;
     }
-    if (delay_ms < 250) delay_ms = 250;
 
     /* Load NVML */
     nvml_ok = (load_nvml() == 0);
@@ -1354,26 +1260,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Initial CPU tick read */
+    /* Initial CPU tick read (baseline for the first scrape's usage delta) */
     read_cpu_ticks(prev_ticks, &num_cpus);
-    usleep(100000); /* brief pause for first delta */
-    compute_cpu_usage();
-
-    /* Detect RDMA/InfiniBand ports */
-    read_net_totals();
-    read_rdma_ports();
 
     /* Start Prometheus exporter */
     if (prom_start() != 0)
         return 1;
 
     fprintf(stderr, "Running (Ctrl+C to stop)\n");
-    while (!g_quit) {
-        compute_cpu_usage();
-        read_net_totals();
-        read_rdma_ports();
-        usleep(delay_ms * 1000);
-    }
+    while (!g_quit)
+        pause(); /* main thread idles; all collection happens in the scrape path */
     fprintf(stderr, "\nStopped.\n");
 
     prom_stop();

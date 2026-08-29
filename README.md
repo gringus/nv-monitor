@@ -8,7 +8,7 @@ Accurately monitor a single machine or an entire cluster with minimal overhead. 
 
 ## Design
 
-- Collects at a 1s default interval, adjustable via CLI (`-r`)
+- Scrape-driven: every scrape samples the sensors fresh — CPU% is the delta since the previous scrape, network/RDMA are raw `*_total` counters (use `rate()` in PromQL). No internal timer.
 - NVML loaded dynamically at runtime — no hard dependency on NVIDIA drivers
 - Correctly handles **HugePages** on DGX Spark where `MemAvailable` is inaccurate
 - Reports metrics to NVIDIA specifications via NVML, with correct handling of unified memory and ARM big.LITTLE core topology (per-core `type` labels: **X925** performance / **X725** efficiency on Grace)
@@ -38,7 +38,6 @@ make
 
 ```bash
 ./nv-monitor -p 9101                   # Prometheus metrics on :9101
-./nv-monitor -p 9101 -r 2000           # Collect every 2s
 ```
 
 Or install system-wide:
@@ -53,7 +52,6 @@ sudo make install
 |------------|--------------------------------------------|---------|
 | `-p PORT`  | Expose Prometheus metrics on PORT          | required |
 | `-t TOKEN` | Require Bearer token for `/metrics`        | off     |
-| `-r MS`    | Collection interval in milliseconds        | 1000    |
 | `-v`       | Show version                               |         |
 | `-h`       | Show help                                  |         |
 

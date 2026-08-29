@@ -26,10 +26,10 @@ Works on both **aarch64** (DGX Spark) and **x86_64**. On x86, ARM core type labe
 Everything is in `nv-monitor.c` (~1450 lines). Key sections:
 
 - **NVML dynamic loading**: Loads `libnvidia-ml.so.1` via `dlopen`/`dlsym` at runtime. Uses a variadic LOAD macro to try versioned symbols first (e.g. `nvmlInit_v2` before `nvmlInit`). All NVML function pointers are prefixed with `p` (e.g. `pNvmlInit`).
-- **CPU sampling**: Reads `/proc/stat` delta between collection cycles to compute per-core usage percentages.
+- **CPU sampling**: Reads `/proc/stat` delta between consecutive scrapes to compute per-core usage percentages.
 - **Memory**: Parses `/proc/meminfo` for used/available/buffers/cached/swap.
 - **CPU thermals/freq**: Reads per-thermal-zone temps via `read_thermal_zones()` from `/sys/class/thermal/` and per-core frequencies from `/sys/devices/system/cpu/`.
-- **Prometheus exporter**: A minimal HTTP server on a dedicated pthread, serving OpenMetrics-formatted metrics at `/metrics`. Uses POSIX sockets with `poll()` for clean shutdown. `-p PORT` is required; the main loop collects at the `-r MS` interval (default 1000, floor 250) and the scrape path re-reads fresh sensor data per request. Enables multi-machine monitoring via Prometheus/Grafana.
+- **Prometheus exporter**: A minimal HTTP server on a dedicated pthread, serving OpenMetrics-formatted metrics at `/metrics`. Uses POSIX sockets with `poll()` for clean shutdown. `-p PORT` is required. The main thread idles in `pause()` — **all collection happens in the scrape path**: CPU% is the delta between scrapes, network/RDMA are raw `*_total` counters read per scrape, everything else sampled fresh. There is no internal timer. Enables multi-machine monitoring via Prometheus/Grafana.
 
 ## Memory allocation (CRITICAL — do not add runtime allocations)
 
