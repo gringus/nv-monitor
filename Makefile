@@ -2,7 +2,7 @@ CC      ?= cc
 VERSION  = $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 CFLAGS   = -O3 -march=native -flto -Wall -Wextra -std=gnu11 -DVERSION='"$(VERSION)"'
 CFLAGS_PORTABLE = -O3 -flto -Wall -Wextra -std=gnu11 -DVERSION='"$(VERSION)"'
-LDFLAGS  = -lncursesw -ldl -lpthread
+LDFLAGS  = -ldl -lpthread
 PREFIX   ?= /usr/local
 TARGET   = nv-monitor
 
@@ -27,7 +27,7 @@ lint:
 	@echo "Running cppcheck..."
 	cppcheck --enable=all --suppress=missingIncludeSystem nv-monitor.c
 	@echo "Running clang-tidy..."
-	clang-tidy-20 nv-monitor.c -- --std=gnu11 -lncursesw -ldl -lpthread -Wall -Wextra
+	clang-tidy-20 nv-monitor.c -- --std=gnu11 -ldl -lpthread -Wall -Wextra
 
 clean:
 	rm -f $(TARGET) demo-load test_meminfo test_thermal

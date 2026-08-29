@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/nv-monitor -n -p 9101
+ExecStart=/usr/bin/nv-monitor -p 9101
 Restart=on-failure
 RestartSec=5
 

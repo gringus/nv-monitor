@@ -35,8 +35,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start nv-monitor: headless at fastest refresh (250ms floor), prometheus enabled
-"$NV_MONITOR" -n -r 250 -p $PROM_PORT &>/dev/null &
+# Start nv-monitor at fastest collection rate (250ms floor), prometheus enabled
+"$NV_MONITOR" -r 250 -p $PROM_PORT &>/dev/null &
 NV_PID=$!
 sleep 2
 

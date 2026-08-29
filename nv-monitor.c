@@ -1,10 +1,10 @@
 /*
- * nv-monitor - System monitor for NVIDIA DGX Spark (Grace + GB10)
+ * nv-monitor - Prometheus exporter for NVIDIA DGX Spark (Grace + GB10)
  *
- * Displays CPU per-core usage, memory, CPU thermals, GPU utilization,
- * GPU temperature/power/clock, and GPU processes in a single TUI.
+ * Headless exporter: CPU, memory, GPU, NIC, RDMA and thermal-zone metrics
+ * on an HTTP endpoint (-p PORT).
  *
- * Build: gcc -O2 -o nv-monitor nv-monitor.c -lncurses -ldl -lpthread
+ * Build: gcc -O2 -o nv-monitor nv-monitor.c -ldl -lpthread
  */
 
 #ifndef VERSION
@@ -20,8 +20,6 @@
 #include <dirent.h>
 #include <signal.h>
 #include <time.h>
-#include <pwd.h>
-#include <ncurses.h>
 #include <locale.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
@@ -49,13 +47,6 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
-typedef struct {
-    unsigned int pid;
-    unsigned long long usedGpuMemory;
-    unsigned int gpuInstanceId;
-    unsigned int computeInstanceId;
-} nvmlProcessInfo_t;
-
 #define NVML_SUCCESS 0
 #define NVML_ERROR_NOT_SUPPORTED 3
 #define NVML_TEMPERATURE_GPU 0
@@ -74,8 +65,6 @@ static nvmlReturn_t (*pNvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t *);
 static nvmlReturn_t (*pNvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int *);
-static nvmlReturn_t (*pNvmlDeviceGetComputeRunningProcesses)(nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
-static nvmlReturn_t (*pNvmlDeviceGetGraphicsRunningProcesses)(nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
 static nvmlReturn_t (*pNvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
@@ -84,16 +73,10 @@ static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
 static unsigned int gpu_count = 0;      /* number of GPUs detected */
 static int   use_tegra_gpu = 0;         /* prefer Tegra sysfs over NVML for GPU metrics */
-static char  cpu_model_name[128] = "";  /* from /proc/cpuinfo */
-static char  host_name[256] = "";       /* local hostname, shortened before first dot */
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define MAX_GPU_PROCS 256
 #define REFRESH_MS    1000
-#define BAR_CHAR_FULL  ACS_BLOCK
-#define COLOR_GRAY     8
-#define HISTORY_LEN   20
 #define MAX_THERMAL_ZONES 20
 #define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c overrides this */
 
@@ -111,112 +94,13 @@ static double   *cpu_pct = NULL;     /* [max_cpus + 1] */
 static unsigned int *cpu_part = NULL; /* [max_cpus] */
 static int      *cpu_freq_mhz = NULL; /* [max_cpus + 1] — per-core frequency */
 
-/* ── GPU process info ───────────────────────────────────────────────── */
-
-typedef struct {
-    unsigned int  pid;
-    unsigned int  gpu_id;  /* which GPU this process belongs to */
-    unsigned long long mem_bytes;
-    char          name[256];
-    char          user[64];
-    char          type;    /* C=compute, G=graphics */
-    double        cpu_pct; /* per-process CPU% */
-} GpuProc;
-
-/* ── Per-process CPU tracking ───────────────────────────────────────── */
-
-#define MAX_TRACKED_PIDS 512
-
-typedef struct {
-    unsigned int  pid;
-    unsigned long long ticks; /* utime + stime */
-} ProcCpuSnap;
-
-static ProcCpuSnap prev_proc_snaps[MAX_TRACKED_PIDS];
-static int         prev_proc_count = 0;
-static unsigned long long prev_total_cpu_ticks = 0;
-
-static unsigned long long read_proc_cpu_ticks(unsigned int pid) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%u/stat", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char buf[1024];
-    int n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = '\0';
-    fclose(f);
-    char *cp = strrchr(buf, ')');
-    if (!cp) return 0;
-    cp += 2;
-    unsigned long utime = 0, stime = 0;
-    sscanf(cp, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
-           &utime, &stime);
-    return utime + stime;
-}
-
-static unsigned long long read_total_cpu_ticks_sum(void) {
-    FILE *f = fopen("/proc/stat", "r");
-    if (!f) return 0;
-    char line[512];
-    unsigned long long sum = 0;
-    if (fgets(line, sizeof(line), f)) {
-        unsigned long long u, n, s, id, io, ir, si, st;
-        sscanf(line + 4, "%llu %llu %llu %llu %llu %llu %llu %llu",
-               &u, &n, &s, &id, &io, &ir, &si, &st);
-        sum = u + n + s + id + io + ir + si + st;
-    }
-    fclose(f);
-    return sum;
-}
-
-static double calc_proc_cpu_pct(unsigned int pid) {
-    unsigned long long cur_ticks = read_proc_cpu_ticks(pid);
-    unsigned long long cur_total = read_total_cpu_ticks_sum();
-    unsigned long long total_delta = cur_total - prev_total_cpu_ticks;
-
-    /* Find previous snapshot for this PID */
-    for (int i = 0; i < prev_proc_count; i++) {
-        if (prev_proc_snaps[i].pid == pid) {
-            unsigned long long proc_delta = cur_ticks - prev_proc_snaps[i].ticks;
-            if (total_delta > 0)
-                return (double)proc_delta / (double)total_delta * 100.0 * num_cpus;
-            return 0.0;
-        }
-    }
-    return 0.0; /* no previous sample */
-}
-
-static void update_proc_cpu_snapshots(GpuProc *procs, int count) {
-    prev_proc_count = 0;
-    for (int i = 0; i < count && prev_proc_count < MAX_TRACKED_PIDS; i++) {
-        prev_proc_snaps[prev_proc_count].pid = procs[i].pid;
-        prev_proc_snaps[prev_proc_count].ticks = read_proc_cpu_ticks(procs[i].pid);
-        prev_proc_count++;
-    }
-    prev_total_cpu_ticks = read_total_cpu_ticks_sum();
-}
-
-/* ── History ring buffers ────────────────────────────────────────────── */
-
-static double cpu_history[HISTORY_LEN];
-static double gpu_history[HISTORY_LEN];
-static int    history_pos = 0;
-static int    history_count = 0;
-
 /* ── Globals ────────────────────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_quit = 0;
-static int sort_mode = 0; /* 0=by mem, 1=by pid */
 static int delay_ms = REFRESH_MS;
-static double last_gpu_util = 0; /* average GPU util captured during draw for history */
-static int cpu_columns = 0;  /* 0 = auto, 1-4 = user override */
-static int cpu_scroll  = 0;  /* first visible core row offset */
-static int skip_history_once = 0; /* suppress history chart for one frame after resize */
-static int gpu_view = 0;  /* 0=auto, 1=compact, 2=detailed */
 
 /* Command-line options */
-static int   no_ui = 0;
-static int   prom_port = 0;  /* Prometheus metrics port (0 = disabled) */
+static int   prom_port = 0;  /* Prometheus metrics port (0 = not set) */
 static const char *prom_token = NULL; /* Bearer token for /metrics auth */
 
 /* ── Signal handler ─────────────────────────────────────────────────── */
@@ -262,8 +146,6 @@ static int load_nvml(void) {
     LOAD(pNvmlDeviceGetTemperature,               "nvmlDeviceGetTemperature");
     LOAD(pNvmlDeviceGetPowerUsage,                "nvmlDeviceGetPowerUsage");
     LOAD(pNvmlDeviceGetClockInfo,                 "nvmlDeviceGetClockInfo");
-    LOAD(pNvmlDeviceGetComputeRunningProcesses,   "nvmlDeviceGetComputeRunningProcesses_v3", "nvmlDeviceGetComputeRunningProcesses");
-    LOAD(pNvmlDeviceGetGraphicsRunningProcesses,  "nvmlDeviceGetGraphicsRunningProcesses_v3", "nvmlDeviceGetGraphicsRunningProcesses");
     LOAD(pNvmlDeviceGetFanSpeed,                  "nvmlDeviceGetFanSpeed");
     LOAD(pNvmlDeviceGetEncoderUtilization,        "nvmlDeviceGetEncoderUtilization");
     LOAD(pNvmlDeviceGetDecoderUtilization,        "nvmlDeviceGetDecoderUtilization");
@@ -276,46 +158,6 @@ static int load_nvml(void) {
 }
 
 /* ── CPU core type identification ───────────────────────────────────── */
-
-static void read_cpu_model_name(void) {
-    /* Try device tree model first (works on ARM SBCs, DGX Spark, etc.) */
-    FILE *f = fopen("/sys/firmware/devicetree/base/model", "r");
-    if (f) {
-        if (fgets(cpu_model_name, sizeof(cpu_model_name), f))
-            cpu_model_name[strcspn(cpu_model_name, "\n\r")] = '\0';
-        fclose(f);
-        if (cpu_model_name[0]) return;
-    }
-
-    /* DMI product name (works on DGX Spark, most x86 systems) */
-    f = fopen("/sys/devices/virtual/dmi/id/product_name", "r");
-    if (f) {
-        if (fgets(cpu_model_name, sizeof(cpu_model_name), f))
-            cpu_model_name[strcspn(cpu_model_name, "\n\r")] = '\0';
-        fclose(f);
-        /* Clean up underscores for display */
-        for (char *p = cpu_model_name; *p; p++)
-            if (*p == '_') *p = ' ';
-        if (cpu_model_name[0]) return;
-    }
-
-    /* x86: "model name" from /proc/cpuinfo */
-    f = fopen("/proc/cpuinfo", "r");
-    if (!f) return;
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char *sep = strchr(line, ':');
-        if (!sep) continue;
-        if (strncmp(line, "model name", 10) == 0) {
-            const char *val = sep + 1;
-            while (*val == ' ' || *val == '\t') val++;
-            snprintf(cpu_model_name, sizeof(cpu_model_name), "%s", val);
-            cpu_model_name[strcspn(cpu_model_name, "\n\r")] = '\0';
-            break;
-        }
-    }
-    fclose(f);
-}
 
 static void read_cpu_part_ids(void) {
     FILE *f = fopen("/proc/cpuinfo", "r");
@@ -503,21 +345,6 @@ static void read_cpu_freqs(void) {
     }
 }
 
-static void read_host_name(void) {
-    if (gethostname(host_name, sizeof(host_name) - 1) != 0) {
-        host_name[0] = '\0';
-        return;
-    }
-    host_name[sizeof(host_name) - 1] = '\0';
-    char *dot = strchr(host_name, '.');
-    if (dot) *dot = '\0';
-}
-
-/* Forward declarations for process lookup (used by Tegra GPU scanner) */
-static void get_proc_cmdline(unsigned int pid, char *buf, int len);
-static void get_proc_user(unsigned int pid, char *buf, int len);
-static double calc_proc_cpu_pct(unsigned int pid);
-
 /* ── Tegra GPU sysfs fallback (Jetson Orin / Nano / NX / AGX) ──────── */
 
 static int tegra_gpu_available = 0;
@@ -582,26 +409,6 @@ static int read_tegra_gpu_temp(void) {
     return t / 1000;
 }
 
-/* Scan /proc for processes with open fds to GPU device nodes.
- * Used on Jetson where NVML process listing returns garbage. */
-static dev_t tegra_gpu_dev = 0; /* device ID of /dev/nvhost-gpu or /dev/dri/card0 */
-
-static void detect_tegra_gpu_dev(void) {
-    const char *dev_paths[] = {
-        "/dev/nvhost-gpu",
-        "/dev/dri/card0",
-        "/dev/dri/renderD128",
-        NULL
-    };
-    struct stat st;
-    for (int i = 0; dev_paths[i]; i++) {
-        if (stat(dev_paths[i], &st) == 0 && S_ISCHR(st.st_mode)) {
-            tegra_gpu_dev = st.st_rdev;
-            break;
-        }
-    }
-}
-
 /* ── NIC ASIC temperature (ConnectX / mlx5) ─────────────────────────── */
 
 #define MAX_NIC_SENSORS 8
@@ -654,344 +461,12 @@ static int read_nic_asic_temp(void) {
     return max_temp;
 }
 
-static int scan_tegra_gpu_procs(GpuProc *procs, int max_procs) {
-    if (!tegra_gpu_dev && !use_tegra_gpu) return 0;
-    int n = 0;
-    pid_t my_pid = getpid();
-
-    DIR *proc_dir = opendir("/proc");
-    if (!proc_dir) return 0;
-
-    struct dirent *pent;
-    while ((pent = readdir(proc_dir)) && n < max_procs) {
-        /* Skip non-numeric entries */
-        unsigned int pid = 0;
-        if (sscanf(pent->d_name, "%u", &pid) != 1 || pid == 0) continue;
-        if ((pid_t)pid == my_pid) continue; /* skip ourselves */
-
-        /* Check if this PID already found */
-        int dup = 0;
-        for (int i = 0; i < n; i++)
-            if (procs[i].pid == pid) { dup = 1; break; }
-        if (dup) continue;
-
-        char fd_dir[64];
-        snprintf(fd_dir, sizeof(fd_dir), "/proc/%u/fd", pid);
-        DIR *fds = opendir(fd_dir);
-        if (!fds) continue;
-
-        int found = 0;
-        struct dirent *fent;
-        while ((fent = readdir(fds))) {
-            char fd_path[128], link_target[256];
-            snprintf(fd_path, sizeof(fd_path), "/proc/%u/fd/%s", pid, fent->d_name);
-
-            /* Check 1: device file matches GPU device ID */
-            struct stat fd_stat;
-            if (tegra_gpu_dev && stat(fd_path, &fd_stat) == 0 &&
-                S_ISCHR(fd_stat.st_mode) &&
-                fd_stat.st_rdev == tegra_gpu_dev) {
-                found = 1;
-                break;
-            }
-
-            /* Check 2: symlink target contains nvhost GPU or DRI render node */
-            int llen = readlink(fd_path, link_target, sizeof(link_target) - 1);
-            if (llen > 0) {
-                link_target[llen] = '\0';
-                if (strstr(link_target, "nvhost") && strstr(link_target, "gpu")) {
-                    found = 1;
-                    break;
-                }
-                if (strstr(link_target, "/dev/dri/render")) {
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        closedir(fds);
-
-        if (found) {
-            GpuProc *p = &procs[n];
-            p->pid = pid;
-            p->mem_bytes = 0; /* not available via fd scan */
-            p->type = 'C';
-            p->cpu_pct = calc_proc_cpu_pct(pid);
-            get_proc_cmdline(pid, p->name, sizeof(p->name));
-            get_proc_user(pid, p->user, sizeof(p->user));
-            n++;
-        }
-    }
-    closedir(proc_dir);
-    return n;
-}
-
-/* ── Process name lookup ────────────────────────────────────────────── */
-
-static void get_proc_name(unsigned int pid, char *buf, int len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%u/comm", pid);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        if (fgets(buf, len, f)) {
-            char *nl = strchr(buf, '\n');
-            if (nl) *nl = '\0';
-        }
-        fclose(f);
-    } else {
-        snprintf(buf, len, "[pid %u]", pid);
-    }
-}
-
-static void get_proc_cmdline(unsigned int pid, char *buf, int len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%u/cmdline", pid);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        int n = fread(buf, 1, len - 1, f);
-        fclose(f);
-        if (n > 0) {
-            buf[n] = '\0';
-            /* Replace nulls with spaces */
-            for (int i = 0; i < n - 1; i++)
-                if (buf[i] == '\0') buf[i] = ' ';
-            /* Shorten the first arg (command) to its basename, keep the rest */
-            char *space = strchr(buf, ' ');
-            char *slash = NULL;
-            if (space)
-                slash = memrchr(buf, '/', space - buf);
-            else
-                slash = strrchr(buf, '/');
-            if (slash)
-                memmove(buf, slash + 1, strlen(slash + 1) + 1);
-            return;
-        }
-    }
-    get_proc_name(pid, buf, len);
-}
-
-static void get_proc_user(unsigned int pid, char *buf, int len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%u/status", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) { snprintf(buf, len, "?"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        unsigned int uid;
-        if (sscanf(line, "Uid:\t%u", &uid) == 1) {
-            struct passwd *pw = getpwuid(uid);
-            if (pw)
-                snprintf(buf, len, "%s", pw->pw_name);
-            else
-                snprintf(buf, len, "%u", uid);
-            fclose(f);
-            return;
-        }
-    }
-    fclose(f);
-    snprintf(buf, len, "?");
-}
-
-/* ── Drawing helpers ────────────────────────────────────────────────── */
-
-static void draw_bar(int y, int x, int width, double pct, int color_pair) {
-    int filled = (int)(pct / 100.0 * width + 0.5);
-    if (filled > width) filled = width;
-
-    move(y, x);
-    attron(COLOR_PAIR(color_pair));
-    for (int i = 0; i < filled; i++)
-        addch(ACS_BLOCK);
-    attroff(COLOR_PAIR(color_pair));
-
-    attron(COLOR_PAIR(8)); /* dim */
-    for (int i = filled; i < width; i++)
-        addch(ACS_BULLET);
-    attroff(COLOR_PAIR(8));
-}
-
-static void draw_bar_segmented(int y, int x, int width,
-                               double pct_used, double pct_bufcache,
-                               int color_used, int color_cache) {
-    int filled_used = (int)(pct_used / 100.0 * width + 0.5);
-    int filled_cache = (int)(pct_bufcache / 100.0 * width + 0.5);
-    if (filled_used + filled_cache > width) filled_cache = width - filled_used;
-
-    move(y, x);
-    attron(COLOR_PAIR(color_used));
-    for (int i = 0; i < filled_used; i++) addch(ACS_BLOCK);
-    attroff(COLOR_PAIR(color_used));
-
-    attron(COLOR_PAIR(color_cache));
-    for (int i = 0; i < filled_cache; i++) addch(ACS_BLOCK);
-    attroff(COLOR_PAIR(color_cache));
-
-    attron(COLOR_PAIR(8));
-    for (int i = filled_used + filled_cache; i < width; i++) addch(ACS_BULLET);
-    attroff(COLOR_PAIR(8));
-}
-
-static const char *fmt_bytes(unsigned long long bytes, char *buf, int len) {
-    if (bytes >= (1ULL << 30))
-        snprintf(buf, len, "%.1fG", (double)bytes / (1ULL << 30));
-    else if (bytes >= (1ULL << 20))
-        snprintf(buf, len, "%.1fM", (double)bytes / (1ULL << 20));
-    else if (bytes >= (1ULL << 10))
-        snprintf(buf, len, "%.1fK", (double)bytes / (1ULL << 10));
-    else
-        snprintf(buf, len, "%lluB", bytes);
-    return buf;
-}
-
-static const char *fmt_rate(double bytes_per_sec, char *buf, int len) {
-    if (bytes_per_sec >= (1ULL << 30))
-        snprintf(buf, len, "%.1fG/s", bytes_per_sec / (double)(1ULL << 30));
-    else if (bytes_per_sec >= (1ULL << 20))
-        snprintf(buf, len, "%.1fM/s", bytes_per_sec / (double)(1ULL << 20));
-    else if (bytes_per_sec >= (1ULL << 10))
-        snprintf(buf, len, "%.1fK/s", bytes_per_sec / (double)(1ULL << 10));
-    else
-        snprintf(buf, len, "%.0fB/s", bytes_per_sec);
-    return buf;
-}
-
-/* ── Uptime ─────────────────────────────────────────────────────────── */
-
-static void fmt_uptime(char *buf, int len) {
-    struct sysinfo si;
-    if (sysinfo(&si) != 0) { snprintf(buf, len, "?"); return; }
-    long s = si.uptime;
-    int days = s / 86400; s %= 86400;
-    int hrs  = s / 3600;  s %= 3600;
-    int mins = s / 60;
-    if (days > 0)
-        snprintf(buf, len, "%dd %dh %dm", days, hrs, mins);
-    else
-        snprintf(buf, len, "%dh %dm", hrs, mins);
-}
-
 /* ── Load average ───────────────────────────────────────────────────── */
 
 static void get_loadavg(double *l1, double *l5, double *l15) {
     *l1 = *l5 = *l15 = 0.0;
     FILE *f = fopen("/proc/loadavg", "r");
     if (f) { (void)!fscanf(f, "%lf %lf %lf", l1, l5, l15); fclose(f); }
-}
-
-/* ── History chart ──────────────────────────────────────────────────── */
-
-/* Unicode block elements: ▁▂▃▄▅▆▇█ (U+2581..U+2588) */
-static const char *block_chars[] = {
-    " ", "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
-    "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86",
-    "\xe2\x96\x87", "\xe2\x96\x88"
-};
-
-static void draw_history_chart(int top_y, int total_w, int chart_h) {
-    int n = history_count < HISTORY_LEN ? history_count : HISTORY_LEN;
-    if (n == 0) return;
-
-    int margin = 2;
-    int label_w = 5; /* "100% " */
-    int left_x = margin + label_w;
-    int right_x = total_w - margin;
-    int avail_w = right_x - left_x;
-    if (avail_w < 10) return;
-
-    /* Title centered above chart */
-    int title_x = left_x;
-    attron(A_BOLD | COLOR_PAIR(7));
-    mvprintw(top_y - 1, title_x, "CPU");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    attron(COLOR_PAIR(8));
-    printw("/");
-    attroff(COLOR_PAIR(8));
-    attron(A_BOLD | COLOR_PAIR(6));
-    printw("GPU");
-    attroff(A_BOLD | COLOR_PAIR(6));
-    attron(COLOR_PAIR(8));
-    printw(" history");
-    attroff(COLOR_PAIR(8));
-
-    /* Fixed column width based on max samples — prevents rescaling as history fills.
-     * Each sample: cpu_w + gpu_w + 1 gap char */
-    int col_w = avail_w / HISTORY_LEN;
-    if (col_w < 3) col_w = 3;
-    int gap = 1;
-    int bar_w = col_w - gap;
-    int cpu_w = bar_w / 2;
-    int gpu_w = bar_w - cpu_w;
-
-    /* Clamp visible samples to what fits in avail_w. On very narrow terminals
-     * this shows fewer samples rather than overflowing into other lines. */
-    int max_visible = avail_w / col_w;
-    if (max_visible < 1) return;
-    int visible = n;
-    if (visible > max_visible) visible = max_visible;
-
-    /* Right-align: new samples appear on the right */
-    int chart_total = visible * col_w;
-    int x_start = right_x - chart_total;
-
-    for (int s = 0; s < visible; s++) {
-        int idx = (history_pos - visible + s + HISTORY_LEN) % HISTORY_LEN;
-        double cpu_val = cpu_history[idx];
-        double gpu_val = gpu_history[idx];
-
-        int cpu_blocks = (int)(cpu_val / 100.0 * chart_h * 8 + 0.5);
-        int gpu_blocks = (int)(gpu_val / 100.0 * chart_h * 8 + 0.5);
-
-        int x = x_start + s * col_w;
-
-        for (int row = 0; row < chart_h; row++) {
-            int ry = top_y + chart_h - 1 - row;
-            int row_base = row * 8;
-
-            int cpu_fill = cpu_blocks - row_base;
-            if (cpu_fill < 0) cpu_fill = 0;
-            if (cpu_fill > 8) cpu_fill = 8;
-
-            int gpu_fill = gpu_blocks - row_base;
-            if (gpu_fill < 0) gpu_fill = 0;
-            if (gpu_fill > 8) gpu_fill = 8;
-
-            move(ry, x);
-            attron(COLOR_PAIR(2)); /* green = CPU */
-            for (int c = 0; c < cpu_w; c++)
-                printw("%s", block_chars[cpu_fill]);
-            attroff(COLOR_PAIR(2));
-            attron(COLOR_PAIR(6)); /* cyan = GPU */
-            for (int c = 0; c < gpu_w; c++)
-                printw("%s", block_chars[gpu_fill]);
-            attroff(COLOR_PAIR(6));
-            /* gap between samples */
-            printw(" ");
-        }
-    }
-
-    /* Y-axis labels */
-    attron(COLOR_PAIR(8));
-    mvprintw(top_y, margin, "100%%");
-    mvprintw(top_y + chart_h - 1, margin, "  0%%");
-
-    /* X-axis: t-N labels (seconds ago), right-aligned with 0 on the right */
-    int x_row = top_y + chart_h;
-    for (int t = 0; t < visible; t += 5) {
-        int s = visible - 1 - t; /* sample index from right */
-        int x = x_start + s * col_w;
-        if (x >= left_x && x < right_x - 2)
-            mvprintw(x_row, x, "%-3d", t);
-    }
-    /* label */
-    mvprintw(x_row, margin, "  t=");
-    attroff(COLOR_PAIR(8));
-}
-
-static void record_history(double cpu, double gpu) {
-    cpu_history[history_pos] = cpu;
-    gpu_history[history_pos] = gpu;
-    history_pos = (history_pos + 1) % HISTORY_LEN;
-    if (history_count < HISTORY_LEN) history_count++;
 }
 
 /* ── Aggregate network throughput ───────────────────────────────────── */
@@ -1806,797 +1281,31 @@ static void print_usage(const char *prog) {
         "Usage: %s [OPTIONS]\n"
         "\n"
         "Options:\n"
-        "  -c COLS   CPU display columns (1-4, default: auto)\n"
-        "  -g MODE   GPU view mode (auto, compact, detailed)\n"
-        "  -n        No UI (headless mode, requires -p)\n"
-        "  -p PORT   Expose Prometheus metrics on PORT\n"
+        "  -p PORT   Expose Prometheus metrics on PORT (required)\n"
         "  -t TOKEN  Require Bearer token for /metrics (or NV_MONITOR_TOKEN env)\n"
-        "  -r MS     UI refresh interval in milliseconds (default: 1000)\n"
+        "  -r MS     Collection interval in milliseconds (default: 1000)\n"
         "  -v        Show version\n"
         "  -h        Show this help\n"
         "\n"
         "Examples:\n"
-        "  %s -n -p 9101                    Headless Prometheus exporter on :9101\n"
-        "  %s -r 2000                       TUI refreshing every 2s\n"
+        "  %s -p 9101                    Prometheus exporter on :9101\n"
+        "  %s -p 9101 -r 2000            Collect every 2s\n"
         "\n"
         "Copyright (c) 2026 Paul Gresham Advisory LLC\n"
         "https://github.com/wentbackward/nv-monitor\n",
         prog, prog, prog);
 }
 
-/* ── Main draw ──────────────────────────────────────────────────────── */
-
-static void draw_screen(void) {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-
-    erase();
-
-    int y = 0;
-
-    /* ── Header ─────────────────────────────────────────────────────── */
-    char upbuf[64];
-    fmt_uptime(upbuf, sizeof(upbuf));
-    double l1, l5, l15;
-    get_loadavg(&l1, &l5, &l15);
-    int right_x = cols;
-    {
-        char info[160];
-        /* System clock (to the second) when the header has room */
-        time_t now = time(NULL);
-        struct tm tm_now;
-        localtime_r(&now, &tm_now);
-        int len = snprintf(info, sizeof(info),
-                           "%02d:%02d:%02d  up %s  load %.2f %.2f %.2f",
-                           tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec,
-                           upbuf, l1, l5, l15);
-        if (len >= cols) {
-            /* No room for the clock — drop it */
-            len = snprintf(info, sizeof(info),
-                           "up %s  load %.2f %.2f %.2f", upbuf, l1, l5, l15);
-        }
-        if (len > 0 && len < cols) {
-            right_x = cols - len - 1;
-            mvprintw(y, right_x, "%s", info);
-        }
-    }
-
-    int x = 0;
-    const char *title = " nv-monitor";
-    int title_len = (int)strlen(title);
-    attron(A_BOLD | COLOR_PAIR(6));
-    mvprintw(y, x, "%s", title);
-    attroff(A_BOLD | COLOR_PAIR(6));
-    x += title_len;
-
-    if (host_name[0] && x < right_x) {
-        char host_label[300];
-        int remaining = right_x - x;
-        int host_len = snprintf(host_label, sizeof(host_label), "  @%s", host_name);
-        if (host_len > remaining) host_len = remaining;
-        if (host_len > 0) {
-            attron(A_BOLD | COLOR_PAIR(3));
-            mvprintw(y, x, "%.*s", host_len, host_label);
-            attroff(A_BOLD | COLOR_PAIR(3));
-            x += host_len;
-        }
-    }
-
-    if (x < right_x) {
-        const char *cpu = cpu_model_name[0] ? cpu_model_name : "Unknown CPU";
-        int remaining = right_x - x;
-        if (remaining > 2) {
-            attron(COLOR_PAIR(7));
-            mvprintw(y, x, "  %.*s", remaining - 2, cpu);
-            attroff(COLOR_PAIR(7));
-        }
-    }
-    y += 1;
-
-    attron(COLOR_PAIR(8));
-    mvhline(y, 0, ACS_HLINE, cols);
-    attroff(COLOR_PAIR(8));
-    y += 1;
-
-    /* ── CPU section ────────────────────────────────────────────────── */
-    read_cpu_freqs();
-    int cpu_freq = cpu_freq_mhz[0];
-
-    /* Auto-calculate column count: ~36 chars per column minimum */
-    int ncols;
-    if (cpu_columns > 0) {
-        ncols = cpu_columns;
-    } else {
-        ncols = cols / 36;
-        if (ncols < 1) ncols = 1;
-        if (ncols > 4) ncols = 4;
-    }
-    /* Don't have more columns than cores */
-    int total_core_rows = (num_cpus + ncols - 1) / ncols;
-    if (total_core_rows < 1 && num_cpus > 0) total_core_rows = 1;
-
-    /* Narrow terminal: put "Overall:" on its own line to avoid collision */
-    int narrow_header = (cols < 90);
-
-    /* CPU vertical budget: total rows minus fixed sections.
-     * Per-GPU estimate: header(1) + util(1) + vram(1) + enc/dec(1) + blank(1)
-     * + proc header(1) + ~2 procs(2) + other row(1) = ~10 rows.
-     * Cap at 3 GPUs visible — beyond that, scrolling the GPU section is a
-     * separate problem. */
-    int gpu_rows = (gpu_count == 0 ? 0 :
-                    (gpu_count > 3 ? 30 : (int)gpu_count * 10));
-    int header_rows_extra = narrow_header ? 1 : 0;
-    /* base: title(2) + CPU header(1) + blank(1) + mem(3) + net(2) + blank(1)
-     * + separator(1) + blank(1) + footer(1) = 13 */
-    int base_fixed = 13 + gpu_rows + header_rows_extra;
-    int history_rows = 7;
-    int fixed_rows = base_fixed + history_rows;
-    int cpu_max_rows = rows - fixed_rows;
-    /* If too cramped, drop history to give cores more room */
-    int show_history = 1;
-    if (cpu_max_rows < 5) {
-        show_history = 0;
-        fixed_rows = base_fixed;
-        cpu_max_rows = rows - fixed_rows;
-    }
-    if (cpu_max_rows < 3) cpu_max_rows = 3;
-    if (cpu_max_rows > total_core_rows) cpu_max_rows = total_core_rows;
-
-    /* Clamp scroll */
-    int max_scroll = total_core_rows - cpu_max_rows;
-    if (max_scroll < 0) max_scroll = 0;
-    if (cpu_scroll > max_scroll) cpu_scroll = max_scroll;
-    if (cpu_scroll < 0) cpu_scroll = 0;
-
-    int scrollable = (total_core_rows > cpu_max_rows);
-
-    /* CPU header */
-    attron(A_BOLD | COLOR_PAIR(3));
-    mvprintw(y, 1, "CPU");
-    attroff(A_BOLD | COLOR_PAIR(3));
-    printw("  %d cores", num_cpus);
-    if (scrollable) {
-        int first_core = cpu_scroll * ncols;
-        int last_core = (cpu_scroll + cpu_max_rows) * ncols - 1;
-        if (last_core >= num_cpus) last_core = num_cpus - 1;
-        const char *up   = (cpu_scroll > 0) ? "\xe2\x86\x91" : " ";        /* ↑ */
-        const char *down = (cpu_scroll < max_scroll) ? "\xe2\x86\x93" : " "; /* ↓ */
-        attron(COLOR_PAIR(8));
-        printw(" [%d-%d] ", first_core, last_core);
-        attroff(COLOR_PAIR(8));
-        attron(A_BOLD | COLOR_PAIR(6));
-        printw("%s%s", up, down);
-        attroff(A_BOLD | COLOR_PAIR(6));
-    }
-    if (cpu_freq > 0) printw("  %d MHz", cpu_freq);
-
-    if (narrow_header) {
-        /* Overall bar on its own line (full width) */
-        y += 1;
-        attron(A_BOLD);
-        mvprintw(y, 1, "Overall:");
-        attroff(A_BOLD);
-        int bw = cols - 19;
-        if (bw < 10) bw = 10;
-        int color = cpu_pct[0] > 90 ? 1 : (cpu_pct[0] > 60 ? 3 : 2);
-        draw_bar(y, 11, bw, cpu_pct[0], color);
-        mvprintw(y, 11 + bw, " %4.1f%%", cpu_pct[0]);
-    } else {
-        attron(A_BOLD);
-        mvprintw(y, cols / 2 + 1, "Overall: ");
-        attroff(A_BOLD);
-        int bw = cols / 2 - 17;
-        if (bw < 10) bw = 10;
-        int color = cpu_pct[0] > 90 ? 1 : (cpu_pct[0] > 60 ? 3 : 2);
-        draw_bar(y, cols / 2 + 10, bw, cpu_pct[0], color);
-        mvprintw(y, cols / 2 + 10 + bw, " %4.1f%%", cpu_pct[0]);
-    }
-    y += 1;
-
-    /* Per-core bars - N columns, scrollable */
-    int lbl_w = 9; /* "XX YYYY " — core number + type label */
-    int col_w = cols / ncols;
-    int bar_w = col_w - lbl_w - 8; /* label + suffix " xxx.x%" + margin */
-    if (bar_w < 5) bar_w = 5;
-
-    int visible = cpu_max_rows;
-    for (int r = 0; r < visible; r++) {
-        for (int c = 0; c < ncols; c++) {
-            int core_idx = (cpu_scroll + r) * ncols + c;
-            if (core_idx >= num_cpus) break;
-            int x = c * col_w + 1;
-
-            int color = cpu_pct[core_idx + 1] > 90 ? 1 :
-                       (cpu_pct[core_idx + 1] > 60 ? 3 : 2);
-            const char *lbl = cpu_part_label(core_idx);
-            mvprintw(y, x, "%2d ", core_idx);
-            attron(COLOR_PAIR(8));
-            printw("%-4s ", lbl);
-            attroff(COLOR_PAIR(8));
-            draw_bar(y, x + lbl_w, bar_w, cpu_pct[core_idx + 1], color);
-            mvprintw(y, x + lbl_w + bar_w, " %4.1f%%", cpu_pct[core_idx + 1]);
-        }
-        y++;
-    }
-
-    y += 1;
-
-    /* ── Memory section ─────────────────────────────────────────────── */
-    MemInfo mi;
-    read_meminfo(&mi);
-    double pct_app = mi.total_kb ? (double)mi.app_kb / mi.total_kb * 100.0 : 0;
-    double pct_bufcache = mi.total_kb ? (double)mi.bufcache_kb / mi.total_kb * 100.0 : 0;
-
-    attron(A_BOLD | COLOR_PAIR(4));
-    mvprintw(y, 1, "MEM");
-    attroff(A_BOLD | COLOR_PAIR(4));
-
-    char tb[16], ab[16], bb[16];
-    fmt_bytes(mi.total_kb * 1024ULL, tb, sizeof(tb));
-    fmt_bytes(mi.app_kb * 1024ULL, ab, sizeof(ab));
-    fmt_bytes(mi.bufcache_kb * 1024ULL, bb, sizeof(bb));
-    printw("  ");
-    attron(COLOR_PAIR(2));
-    printw("%s used", ab);
-    attroff(COLOR_PAIR(2));
-    printw(" + ");
-    attron(COLOR_PAIR(4));
-    printw("%s buf/cache", bb);
-    attroff(COLOR_PAIR(4));
-    printw(" / %s", tb);
-    y++;
-
-    {
-        int bw = cols - 13;
-        if (bw < 10) bw = 10;
-        draw_bar_segmented(y, 4, bw, pct_app, pct_bufcache, 2, 4);
-        mvprintw(y, 4 + bw, " %.1f%%", pct_app + pct_bufcache);
-    }
-    y++;
-
-    /* Swap */
-    if (mi.swap_total_kb > 0) {
-        double swap_pct = (double)mi.swap_used_kb / mi.swap_total_kb * 100.0;
-        attron(A_BOLD | COLOR_PAIR(4));
-        mvprintw(y, 1, "SWP");
-        attroff(A_BOLD | COLOR_PAIR(4));
-        char stb[16], sub[16];
-        fmt_bytes(mi.swap_used_kb * 1024ULL, sub, sizeof(sub));
-        fmt_bytes(mi.swap_total_kb * 1024ULL, stb, sizeof(stb));
-        printw("  %s / %s", sub, stb);
-        y++;
-        {
-            int bw = cols - 13;
-            if (bw < 10) bw = 10;
-            int color = swap_pct > 80 ? 1 : (swap_pct > 40 ? 3 : 5);
-            draw_bar(y, 4, bw, swap_pct, color);
-            mvprintw(y, 4 + bw, " %.1f%%", swap_pct);
-        }
-        y++;
-    }
-
-    if (net_totals.valid) {
-        /* Sum RDMA (IB/RoCE) rates into the NET display so CX-7 NCCL traffic is visible.
-         * RDMA bypasses /proc/net/dev entirely, so without this the bar shows near-zero
-         * during inference all-reduces. */
-        double rdma_rx = 0.0, rdma_tx = 0.0;
-        if (rdma_available) {
-            for (int i = 0; i < rdma_count; i++) {
-                rdma_rx += rdma_ports[i].recv_bytes_sec;
-                rdma_tx += rdma_ports[i].xmit_bytes_sec;
-            }
-        }
-        double disp_rx = net_totals.rx_bytes_sec + rdma_rx;
-        double disp_tx = net_totals.tx_bytes_sec + rdma_tx;
-        double total_combined = disp_rx + disp_tx;
-        if (total_combined > net_scale_bytes_sec) net_scale_bytes_sec = total_combined;
-
-        char rx[16], tx[16], scale[16];
-        attron(A_BOLD | COLOR_PAIR(6));
-        mvprintw(y, 1, rdma_available ? "NET+IB" : "NET");
-        attroff(A_BOLD | COLOR_PAIR(6));
-        attron(COLOR_PAIR(2));
-        printw("  ");
-        printw("%s", fmt_rate(disp_rx, rx, sizeof(rx)));
-        attroff(COLOR_PAIR(2));
-        printw(" down");
-        attron(COLOR_PAIR(3));
-        printw("  %s", fmt_rate(disp_tx, tx, sizeof(tx)));
-        attroff(COLOR_PAIR(3));
-        printw(" up");
-        int nic_temp = read_nic_asic_temp();
-        if (nic_temp > 0) {
-            int nt_color = nic_temp >= 95 ? 1 : (nic_temp >= 85 ? 3 : 8);
-            attron(COLOR_PAIR(nt_color));
-            printw("   NIC %d C", nic_temp);
-            attroff(COLOR_PAIR(nt_color));
-        }
-        y++;
-
-        mvprintw(y, 1, "  I/O ");
-        int bw = cols - 24;
-        if (bw < 10) bw = 10;
-        double rx_pct = net_scale_bytes_sec > 0 ? disp_rx / net_scale_bytes_sec * 100.0 : 0;
-        double tx_pct = net_scale_bytes_sec > 0 ? disp_tx / net_scale_bytes_sec * 100.0 : 0;
-        if (rx_pct < 0) rx_pct = 0;
-        if (tx_pct < 0) tx_pct = 0;
-        if (rx_pct + tx_pct > 100.0) {
-            double scale_down = 100.0 / (rx_pct + tx_pct);
-            rx_pct *= scale_down;
-            tx_pct *= scale_down;
-        }
-        draw_bar_segmented(y, 7, bw, rx_pct, tx_pct, 2, 3);
-        attron(COLOR_PAIR(8));
-        mvprintw(y, 7 + bw + 1, "%s peak", fmt_rate(net_scale_bytes_sec, scale, sizeof(scale)));
-        attroff(COLOR_PAIR(8));
-        y++;
-    }
-
-    y += 1;
-    attron(COLOR_PAIR(8));
-    mvhline(y, 0, ACS_HLINE, cols);
-    attroff(COLOR_PAIR(8));
-    y += 1;
-
-    /* ── GPU section ────────────────────────────────────────────────── */
-    if (!nvml_ok && !use_tegra_gpu) {
-        attron(COLOR_PAIR(1));
-        mvprintw(y, 1, "GPU: NVML not available");
-        attroff(COLOR_PAIR(1));
-        y += 2;
-    } else {
-        double gpu_util_sum = 0;
-        unsigned int gpu_util_n = 0;
-
-        /* Determine view mode */
-        int use_compact;
-        if (gpu_view == 1) use_compact = 1;
-        else if (gpu_view == 2) use_compact = 0;
-        else {
-            /* Auto: compact if detailed would overflow */
-            int est_detail_rows = (int)gpu_count * 10;
-            int available = rows - y - 8;
-            use_compact = (est_detail_rows > available && gpu_count > 2);
-        }
-
-        /* ── Collect GPU data for all GPUs ────────────────────────── */
-        typedef struct {
-            char name[96];
-            unsigned int util_gpu, temp, power_mw, clk_gfx;
-            int has_power, has_mem, has_fan, has_enc, has_dec;
-            unsigned int fan, enc, dec;
-            unsigned long long mem_total, mem_used;
-        } GpuSnapshot;
-
-        /* Use stack array — bounded by gpu_count which was validated at startup */
-        GpuSnapshot gpu_snaps[256]; /* stack, not heap — draw_screen is on main thread */
-        if (gpu_count > 256) gpu_count = 256; /* safety */
-
-        GpuProc all_procs_combined[MAX_GPU_PROCS * 2];
-        int n_all_combined = 0;
-
-        for (unsigned int d = 0; d < gpu_count; d++) {
-            GpuSnapshot *gs = &gpu_snaps[d];
-            memset(gs, 0, sizeof(*gs));
-            snprintf(gs->name, sizeof(gs->name), "Unknown");
-
-            nvmlDevice_t dev;
-            if (pNvmlDeviceGetHandleByIndex &&
-                pNvmlDeviceGetHandleByIndex(d, &dev) != NVML_SUCCESS) continue;
-
-            pNvmlDeviceGetName(dev, gs->name, sizeof(gs->name));
-
-            nvmlUtilization_t util = {0};
-            if (!use_tegra_gpu && pNvmlDeviceGetUtilizationRates)
-                pNvmlDeviceGetUtilizationRates(dev, &util);
-            if (use_tegra_gpu) {
-                int tutil = read_tegra_gpu_util();
-                if (tutil >= 0) util.gpu = (unsigned int)tutil;
-            }
-            gs->util_gpu = util.gpu;
-            gpu_util_sum += (double)util.gpu;
-            gpu_util_n++;
-
-            if (!use_tegra_gpu && pNvmlDeviceGetTemperature)
-                pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &gs->temp);
-            if (use_tegra_gpu && tegra_gpu_therm_zone >= 0) {
-                int ttemp = read_tegra_gpu_temp();
-                if (ttemp > 0) gs->temp = (unsigned int)ttemp;
-            }
-
-            gs->has_power = (pNvmlDeviceGetPowerUsage &&
-                             pNvmlDeviceGetPowerUsage(dev, &gs->power_mw) == NVML_SUCCESS);
-            if (pNvmlDeviceGetClockInfo)
-                pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &gs->clk_gfx);
-            gs->has_fan = (pNvmlDeviceGetFanSpeed &&
-                           pNvmlDeviceGetFanSpeed(dev, &gs->fan) == NVML_SUCCESS);
-
-            nvmlMemory_t mem = {0};
-            gs->has_mem = (pNvmlDeviceGetMemoryInfo &&
-                           pNvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS &&
-                           mem.total > 0);
-            if (gs->has_mem) { gs->mem_total = mem.total; gs->mem_used = mem.used; }
-
-            unsigned int enc_period = 0, dec_period = 0;
-            gs->has_enc = (pNvmlDeviceGetEncoderUtilization &&
-                           pNvmlDeviceGetEncoderUtilization(dev, &gs->enc, &enc_period) == NVML_SUCCESS);
-            gs->has_dec = (pNvmlDeviceGetDecoderUtilization &&
-                           pNvmlDeviceGetDecoderUtilization(dev, &gs->dec, &dec_period) == NVML_SUCCESS);
-
-            /* Collect processes for this GPU */
-            nvmlProcessInfo_t comp_procs[MAX_GPU_PROCS];
-            nvmlProcessInfo_t gfx_procs[MAX_GPU_PROCS];
-            unsigned int n_comp = MAX_GPU_PROCS, n_gfx = MAX_GPU_PROCS;
-
-            if (pNvmlDeviceGetComputeRunningProcesses) {
-                int rc = pNvmlDeviceGetComputeRunningProcesses(dev, &n_comp, comp_procs);
-                if (rc != NVML_SUCCESS) n_comp = 0;
-            } else n_comp = 0;
-
-            if (pNvmlDeviceGetGraphicsRunningProcesses) {
-                int rc = pNvmlDeviceGetGraphicsRunningProcesses(dev, &n_gfx, gfx_procs);
-                if (rc != NVML_SUCCESS) n_gfx = 0;
-            } else n_gfx = 0;
-
-            for (unsigned int i = 0; i < n_comp && n_all_combined < MAX_GPU_PROCS * 2; i++) {
-                if (comp_procs[i].pid == 0 || comp_procs[i].pid > 4194304) continue;
-                GpuProc *p = &all_procs_combined[n_all_combined++];
-                p->pid = comp_procs[i].pid;
-                p->gpu_id = d;
-                unsigned long long pmem = comp_procs[i].usedGpuMemory;
-                p->mem_bytes = (pmem == 0xFFFFFFFFFFFFFFFFULL) ? 0 : pmem;
-                p->type = 'C';
-                p->cpu_pct = calc_proc_cpu_pct(p->pid);
-                get_proc_cmdline(p->pid, p->name, sizeof(p->name));
-                get_proc_user(p->pid, p->user, sizeof(p->user));
-            }
-            for (unsigned int i = 0; i < n_gfx && n_all_combined < MAX_GPU_PROCS * 2; i++) {
-                if (gfx_procs[i].pid == 0 || gfx_procs[i].pid > 4194304) continue;
-                int dup = 0;
-                for (int j = 0; j < n_all_combined; j++)
-                    if (all_procs_combined[j].pid == gfx_procs[i].pid) { dup = 1; break; }
-                if (dup) continue;
-                GpuProc *p = &all_procs_combined[n_all_combined++];
-                p->pid = gfx_procs[i].pid;
-                p->gpu_id = d;
-                unsigned long long pmem = gfx_procs[i].usedGpuMemory;
-                p->mem_bytes = (pmem == 0xFFFFFFFFFFFFFFFFULL) ? 0 : pmem;
-                p->type = 'G';
-                p->cpu_pct = calc_proc_cpu_pct(p->pid);
-                get_proc_cmdline(p->pid, p->name, sizeof(p->name));
-                get_proc_user(p->pid, p->user, sizeof(p->user));
-            }
-        }
-
-        /* Tegra fallback for process listing */
-        if (n_all_combined == 0 && use_tegra_gpu)
-            n_all_combined = scan_tegra_gpu_procs(all_procs_combined, MAX_GPU_PROCS * 2);
-
-        update_proc_cpu_snapshots(all_procs_combined, n_all_combined);
-
-        /* Sort processes: by GPU index first, then by sort_mode within each GPU */
-        for (int i = 0; i < n_all_combined - 1; i++)
-            for (int j = i + 1; j < n_all_combined; j++) {
-                int sw = 0;
-                if (all_procs_combined[j].gpu_id < all_procs_combined[i].gpu_id)
-                    sw = 1;
-                else if (all_procs_combined[j].gpu_id == all_procs_combined[i].gpu_id) {
-                    if (sort_mode == 0)
-                        sw = all_procs_combined[j].mem_bytes > all_procs_combined[i].mem_bytes;
-                    else
-                        sw = all_procs_combined[j].pid < all_procs_combined[i].pid;
-                }
-                if (sw) {
-                    GpuProc tmp = all_procs_combined[i];
-                    all_procs_combined[i] = all_procs_combined[j];
-                    all_procs_combined[j] = tmp;
-                }
-            }
-
-        /* ── Render: compact or detailed ──────────────────────────── */
-        if (use_compact) {
-            /* Compact: one row per GPU with mini-bars */
-            int mini_bar_w = 10;
-            attron(A_BOLD | COLOR_PAIR(6));
-            mvprintw(y, 1, " GPU  NAME");
-            attroff(A_BOLD | COLOR_PAIR(6));
-            attron(COLOR_PAIR(8));
-            {
-                int hdr_x = cols > 80 ? 30 : 18;
-                mvprintw(y, hdr_x, "UTIL");
-                mvprintw(y, hdr_x + mini_bar_w + 7, "TEMP  POWER  CLOCK");
-                if (cols > 100) {
-                    int vram_x = hdr_x + mini_bar_w + 32;
-                    mvprintw(y, vram_x, "VRAM");
-                }
-            }
-            attroff(COLOR_PAIR(8));
-            y++;
-
-            for (unsigned int d = 0; d < gpu_count && y < rows - 4; d++) {
-                GpuSnapshot *gs = &gpu_snaps[d];
-
-                /* GPU index */
-                attron(A_BOLD | COLOR_PAIR(6));
-                mvprintw(y, 1, " %3u", d);
-                attroff(A_BOLD | COLOR_PAIR(6));
-
-                /* Name (truncated) */
-                char short_name[32];
-                /* Strip "NVIDIA " prefix for compactness */
-                const char *nm = gs->name;
-                if (strncmp(nm, "NVIDIA ", 7) == 0) nm += 7;
-                int nm_max = cols > 80 ? 22 : 12;
-                snprintf(short_name, sizeof(short_name), "%-.*s", nm_max, nm);
-                printw("  %s", short_name);
-
-                /* Util mini-bar */
-                int bar_x = cols > 80 ? 30 : 18;
-                int util_color = gs->util_gpu > 90 ? 1 : (gs->util_gpu > 60 ? 3 : 6);
-                draw_bar(y, bar_x, mini_bar_w, (double)gs->util_gpu, util_color);
-                mvprintw(y, bar_x + mini_bar_w + 1, "%3u%%", gs->util_gpu);
-
-                /* Temp, power, clock */
-                int info_x = bar_x + mini_bar_w + 7;
-                mvprintw(y, info_x, "%3uC", gs->temp);
-                if (gs->has_power)
-                    mvprintw(y, info_x + 6, "%5.0fW", gs->power_mw / 1000.0);
-                else
-                    mvprintw(y, info_x + 6, "     ");
-                if (gs->clk_gfx)
-                    mvprintw(y, info_x + 13, "%4uMHz", gs->clk_gfx);
-
-                /* VRAM mini-bar (if room and available) */
-                if (cols > 100) {
-                    int vram_x = info_x + 22;
-                    if (gs->has_mem) {
-                        double mem_pct = (double)gs->mem_used / gs->mem_total * 100.0;
-                        int mc = mem_pct > 90 ? 1 : (mem_pct > 60 ? 3 : 5);
-                        draw_bar(y, vram_x, mini_bar_w, mem_pct, mc);
-                        char ub[16], tb2[16];
-                        fmt_bytes(gs->mem_used, ub, sizeof(ub));
-                        fmt_bytes(gs->mem_total, tb2, sizeof(tb2));
-                        mvprintw(y, vram_x + mini_bar_w + 1, "%s/%s", ub, tb2);
-                    } else {
-                        attron(COLOR_PAIR(7));
-                        mvprintw(y, vram_x, "unified");
-                        attroff(COLOR_PAIR(7));
-                    }
-                }
-                y++;
-            }
-
-            y++;
-
-            /* Combined process list with GPU column */
-            if (n_all_combined > 0 && y < rows - 3) {
-                attron(A_BOLD | COLOR_PAIR(7));
-                mvprintw(y, 1, " GPU  %-8s %-10s %-4s %9s %-10s %s",
-                         "PID", "USER", "TYPE", "CPU%", "GPU-MEM", "COMMAND");
-                attroff(A_BOLD | COLOR_PAIR(7));
-                y++;
-
-                for (int i = 0; i < n_all_combined && y < rows - 2; i++) {
-                    GpuProc *p = &all_procs_combined[i];
-                    char mb[16];
-                    if (p->mem_bytes > 0) fmt_bytes(p->mem_bytes, mb, sizeof(mb));
-                    else snprintf(mb, sizeof(mb), "N/A");
-
-                    int name_max = cols - 58;
-                    if (name_max < 0) name_max = 0;
-                    char truncname[256];
-                    snprintf(truncname, sizeof(truncname), "%-.*s", name_max, p->name);
-
-                    int pc = (p->type == 'C') ? 5 : 7;
-                    attron(COLOR_PAIR(6));
-                    mvprintw(y, 1, " %3u", p->gpu_id);
-                    attroff(COLOR_PAIR(6));
-                    printw("  %-8u %-10s ", p->pid, p->user);
-                    attron(COLOR_PAIR(pc));
-                    printw("%-4c", p->type);
-                    attroff(COLOR_PAIR(pc));
-                    printw(" %8.1f%% %-10s %s", p->cpu_pct, mb, truncname);
-                    y++;
-                }
-
-                /* Other processes summary */
-                double gpu_proc_cpu = 0;
-                for (int i = 0; i < n_all_combined; i++)
-                    gpu_proc_cpu += all_procs_combined[i].cpu_pct;
-                double total_cpu = cpu_pct[0] * num_cpus;
-                double other_cpu = total_cpu - gpu_proc_cpu;
-                if (other_cpu < 0) other_cpu = 0;
-                attron(COLOR_PAIR(8));
-                mvprintw(y, 1, " %3s  %-8s %-10s %-4s %8.1f%%",
-                         "", "", "", "", other_cpu);
-                printw(" %-10s %s", "", "(other processes)");
-                attroff(COLOR_PAIR(8));
-                y++;
-            }
-
-        } else {
-            /* ── Detailed view (existing layout) ──────────────────── */
-            for (unsigned int d = 0; d < gpu_count && y < rows - 4; d++) {
-                GpuSnapshot *gs = &gpu_snaps[d];
-
-                /* GPU header line */
-                attron(A_BOLD | COLOR_PAIR(6));
-                mvprintw(y, 1, "GPU %u", d);
-                attroff(A_BOLD | COLOR_PAIR(6));
-                printw("  %s  %u C", gs->name, gs->temp);
-                if (gs->has_power) printw("  %.1fW", gs->power_mw / 1000.0);
-                if (gs->clk_gfx) printw("  %u MHz", gs->clk_gfx);
-                if (gs->has_fan) printw("  Fan %u%%", gs->fan);
-                y++;
-
-                /* GPU utilization bar */
-                mvprintw(y, 1, "  GPU ");
-                {
-                    int bx = 7;
-                    int bw = cols - bx - 7;
-                    if (bw < 10) bw = 10;
-                    int color = gs->util_gpu > 90 ? 1 : (gs->util_gpu > 60 ? 3 : 6);
-                    draw_bar(y, bx, bw, (double)gs->util_gpu, color);
-                    mvprintw(y, bx + bw + 1, "%3u%%", gs->util_gpu);
-                }
-                y++;
-
-                /* Memory usage */
-                if (gs->has_mem) {
-                    mvprintw(y, 1, "  VRAM");
-                    int bx = 7;
-                    int bw = cols - bx - 18;
-                    if (bw < 10) bw = 10;
-                    double mem_pct = (double)gs->mem_used / gs->mem_total * 100.0;
-                    int color = mem_pct > 90 ? 1 : (mem_pct > 60 ? 3 : 5);
-                    draw_bar(y, bx, bw, mem_pct, color);
-                    char ub2[16], tb2[16];
-                    fmt_bytes(gs->mem_used, ub2, sizeof(ub2));
-                    fmt_bytes(gs->mem_total, tb2, sizeof(tb2));
-                    mvprintw(y, bx + bw + 1, "%s/%s", ub2, tb2);
-                } else {
-                    mvprintw(y, 1, "  VRAM");
-                    attron(COLOR_PAIR(7));
-                    printw("  unified memory (shared with CPU)");
-                    attroff(COLOR_PAIR(7));
-                }
-                y++;
-
-                /* Encoder/Decoder */
-                if (gs->has_enc || gs->has_dec) {
-                    mvprintw(y, 1, "  ");
-                    if (gs->has_enc) printw("ENC %u%%  ", gs->enc);
-                    if (gs->has_dec) printw("DEC %u%%", gs->dec);
-                    y++;
-                }
-
-                y++;
-
-                /* Per-GPU process list */
-                int n_this_gpu = 0;
-                for (int i = 0; i < n_all_combined; i++)
-                    if (all_procs_combined[i].gpu_id == d) n_this_gpu++;
-
-                if (n_this_gpu > 0) {
-                    attron(A_BOLD | COLOR_PAIR(7));
-                    mvprintw(y, 1, "  %-8s %-12s %-4s %9s %-12s %s",
-                             "PID", "USER", "TYPE", "CPU%", "GPU-MEM", "COMMAND");
-                    attroff(A_BOLD | COLOR_PAIR(7));
-                    y++;
-
-                    for (int i = 0; i < n_all_combined && y < rows - 2; i++) {
-                        GpuProc *p = &all_procs_combined[i];
-                        if (p->gpu_id != d) continue;
-                        char mb[16];
-                        if (p->mem_bytes > 0) fmt_bytes(p->mem_bytes, mb, sizeof(mb));
-                        else snprintf(mb, sizeof(mb), "N/A");
-
-                        int name_max = cols - 54;
-                        if (name_max < 0) name_max = 0;
-                        char truncname[256];
-                        snprintf(truncname, sizeof(truncname), "%-.*s", name_max, p->name);
-
-                        int pc = (p->type == 'C') ? 5 : 7;
-                        mvprintw(y, 1, "  %-8u %-12s ", p->pid, p->user);
-                        attron(COLOR_PAIR(pc));
-                        printw("%-4c", p->type);
-                        attroff(COLOR_PAIR(pc));
-                        printw(" %8.1f%% %-12s %s", p->cpu_pct, mb, truncname);
-                        y++;
-                    }
-                }
-
-                /* Other processes (only on last GPU in detailed view) */
-                if (d == gpu_count - 1) {
-                    double gpu_proc_cpu = 0;
-                    for (int i = 0; i < n_all_combined; i++)
-                        gpu_proc_cpu += all_procs_combined[i].cpu_pct;
-                    double total_cpu = cpu_pct[0] * num_cpus;
-                    double other_cpu = total_cpu - gpu_proc_cpu;
-                    if (other_cpu < 0) other_cpu = 0;
-                    attron(COLOR_PAIR(8));
-                    mvprintw(y, 1, "  %-8s %-12s %-4s %8.1f%%",
-                             "", "", "", other_cpu);
-                    printw(" %-12s %s", "", "(other processes)");
-                    attroff(COLOR_PAIR(8));
-                    y++;
-                }
-            }
-        }
-
-        last_gpu_util = gpu_util_n > 0 ? gpu_util_sum / gpu_util_n : 0;
-    }
-
-    /* ── History chart (full width) ───────────────────────────────── */
-    record_history(cpu_pct[0], last_gpu_util);
-    if (show_history && !skip_history_once) {
-        int chart_h = 5;
-        int chart_top = rows - 3 - chart_h; /* -3: footer + x-axis + gap */
-        if (chart_top > y + 1 && cols > 20) {
-            draw_history_chart(chart_top, cols, chart_h);
-        }
-    }
-    skip_history_once = 0;
-
-    /* ── Footer ─────────────────────────────────────────────────────── */
-    attron(COLOR_PAIR(8));
-    mvhline(rows - 1, 0, ACS_HLINE, cols);
-    attroff(COLOR_PAIR(8));
-    move(rows - 1, 1);
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw(" q");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":quit ");
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw("s");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":sort ");
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw("c");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":cols ");
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw("g");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":gpu ");
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw("j/k");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":scroll ");
-    attron(A_BOLD | COLOR_PAIR(7));
-    printw("+/-");
-    attroff(A_BOLD | COLOR_PAIR(7));
-    printw(":speed  ");
-    attron(COLOR_PAIR(8));
-    printw("%.1fs", delay_ms / 1000.0);
-    attroff(COLOR_PAIR(8));
-
-    /* Version, right-aligned */
-    attron(COLOR_PAIR(8));
-    mvprintw(rows - 1, cols - (int)strlen(VERSION) - 2, "%s ", VERSION);
-    attroff(COLOR_PAIR(8));
-
-    refresh();
-}
-
 /* ── Main ───────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
-    setlocale(LC_ALL, "");
     setlocale(LC_NUMERIC, "C"); /* Force decimal point for Prometheus exposition format */
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:g:np:t:r:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:r:vh")) != -1) {
         switch (opt) {
-        case 'c': cpu_columns = atoi(optarg); if (cpu_columns < 0 || cpu_columns > 4) cpu_columns = 0; break;
-        case 'g':
-            if (strcmp(optarg, "compact") == 0) gpu_view = 1;
-            else if (strcmp(optarg, "detailed") == 0) gpu_view = 2;
-            else gpu_view = 0;
-            break;
-        case 'n': no_ui = 1; break;
         case 'p': prom_port = atoi(optarg); break;
         case 't': prom_token = optarg; break;
         case 'r': delay_ms = atoi(optarg); break;
@@ -2610,8 +1319,8 @@ int main(int argc, char *argv[]) {
     if (!prom_token)
         prom_token = getenv("NV_MONITOR_TOKEN");
 
-    if (no_ui && !prom_port) {
-        fprintf(stderr, "Error: -n (no UI) requires -p <port>\n");
+    if (!prom_port) {
+        fprintf(stderr, "Error: -p <port> is required\n");
         return 1;
     }
     if (delay_ms < 250) delay_ms = 250;
@@ -2621,14 +1330,11 @@ int main(int argc, char *argv[]) {
     if (nvml_ok && pNvmlDeviceGetCount)
         pNvmlDeviceGetCount(&gpu_count);
 
-    /* Read CPU info */
-    read_host_name();
-    read_cpu_model_name();
+    /* Read CPU core part IDs (for type labels in Prometheus) */
     read_cpu_part_ids();
 
     /* Detect Tegra GPU sysfs (Jetson fallback) */
     detect_tegra_gpu();
-    detect_tegra_gpu_dev();
     detect_nic_asic_sensors();
     /* On Tegra/Jetson, NVML returns SUCCESS but zeros for util/temp — prefer sysfs */
     if (tegra_gpu_available)
@@ -2657,93 +1363,18 @@ int main(int argc, char *argv[]) {
     read_net_totals();
     read_rdma_ports();
 
-    /* Start Prometheus exporter if requested */
-    if (prom_port && prom_start() != 0)
+    /* Start Prometheus exporter */
+    if (prom_start() != 0)
         return 1;
 
-    if (no_ui) {
-        /* ── Headless mode ──────────────────────────────────────────── */
-        fprintf(stderr, "Running headless (Ctrl+C to stop)\n");
-        while (!g_quit) {
-            compute_cpu_usage();
-            read_net_totals();
-            read_rdma_ports();
-            usleep(delay_ms * 1000);
-        }
-        fprintf(stderr, "\nStopped.\n");
-    } else {
-        /* ── TUI mode ───────────────────────────────────────────────── */
-        initscr();
-        cbreak();
-        noecho();
-        curs_set(0);
-        nodelay(stdscr, TRUE);
-        keypad(stdscr, TRUE);
-
-        if (has_colors()) {
-            start_color();
-            use_default_colors();
-            init_pair(1, COLOR_RED,     -1); /* high/critical */
-            init_pair(2, COLOR_GREEN,   -1); /* normal/good */
-            init_pair(3, COLOR_YELLOW,  -1); /* medium */
-            init_pair(4, COLOR_BLUE,    -1); /* buf/cache */
-            init_pair(5, COLOR_MAGENTA, -1); /* compute */
-            init_pair(6, COLOR_CYAN,    -1); /* headers/gpu */
-            init_pair(7, COLOR_WHITE,   -1); /* bold text */
-            init_pair(8, 244,           -1); /* dim/gray (256-color) */
-        }
-
-        while (!g_quit) {
-            compute_cpu_usage();
-            read_net_totals();
-            read_rdma_ports();
-            /* Force full repaint to recover from terminal corruption */
-            clearok(stdscr, TRUE);
-            draw_screen();
-
-            /* Input handling - poll within the refresh interval */
-            int elapsed = 0;
-            while (elapsed < delay_ms && !g_quit) {
-                int ch = getch();
-                if (ch == 'q' || ch == 'Q' || ch == 27) {
-                    g_quit = 1;
-                    break;
-                } else if (ch == 's' || ch == 'S') {
-                    sort_mode = (sort_mode + 1) % 2;
-                    break;
-                } else if (ch == '+' || ch == '=') {
-                    if (delay_ms > 250) delay_ms -= 250;
-                } else if (ch == '-' || ch == '_') {
-                    if (delay_ms < 5000) delay_ms += 250;
-                } else if (ch == 'c' || ch == 'C') {
-                    cpu_columns = (cpu_columns + 1) % 5; /* 0=auto,1,2,3,4 */
-                    cpu_scroll = 0;
-                    skip_history_once = 1;
-                    break;
-                } else if (ch == 'g' || ch == 'G') {
-                    gpu_view = (gpu_view + 1) % 3; /* 0=auto,1=compact,2=detailed */
-                    skip_history_once = 1;
-                    break;
-                } else if (ch == 'j' || ch == KEY_DOWN) {
-                    cpu_scroll++;
-                    skip_history_once = 1;
-                    break;
-                } else if (ch == 'k' || ch == KEY_UP) {
-                    if (cpu_scroll > 0) cpu_scroll--;
-                    skip_history_once = 1;
-                    break;
-                } else if (ch == KEY_RESIZE) {
-                    cpu_scroll = 0;
-                    skip_history_once = 1;
-                    break; /* redraw immediately */
-                }
-                usleep(50000);
-                elapsed += 50;
-            }
-        }
-
-        endwin();
+    fprintf(stderr, "Running (Ctrl+C to stop)\n");
+    while (!g_quit) {
+        compute_cpu_usage();
+        read_net_totals();
+        read_rdma_ports();
+        usleep(delay_ms * 1000);
     }
+    fprintf(stderr, "\nStopped.\n");
 
     prom_stop();
     if (nvml_ok && pNvmlShutdown) pNvmlShutdown();

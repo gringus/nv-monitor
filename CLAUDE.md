@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-nv-monitor is a single-file C terminal system monitor for the NVIDIA DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It combines CPU, memory, and GPU monitoring in one ncurses TUI.
+nv-monitor is a single-file C headless Prometheus exporter for the NVIDIA DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It exposes CPU, memory, GPU, NIC, RDMA, and thermal-zone metrics on an HTTP endpoint for Prometheus scraping. There is no TUI — the exporter is the only mode.
 
 ## Build
 
@@ -15,24 +15,21 @@ make test     # builds and runs unit tests
 make clean    # removes binaries
 ```
 
-Direct compilation: `gcc -O2 -Wall -Wextra -std=gnu11 -o nv-monitor nv-monitor.c -lncursesw -ldl -lpthread`
+Direct compilation: `gcc -O2 -Wall -Wextra -std=gnu11 -o nv-monitor nv-monitor.c -ldl -lpthread`
 
-Dependencies: `build-essential`, `libncurses-dev`
+Dependencies: `build-essential`
 
 Works on both **aarch64** (DGX Spark) and **x86_64**. On x86, ARM core type labels are omitted; everything else works identically.
 
 ## Architecture
 
-Everything is in `nv-monitor.c` (~1640 lines). Key sections:
+Everything is in `nv-monitor.c` (~1450 lines). Key sections:
 
-- **NVML dynamic loading** (line ~115): Loads `libnvidia-ml.so.1` via `dlopen`/`dlsym` at runtime. Uses a variadic LOAD macro to try versioned symbols first (e.g. `nvmlInit_v2` before `nvmlInit`). All NVML function pointers are prefixed with `p` (e.g. `pNvmlInit`).
-- **CPU sampling**: Reads `/proc/stat` delta between frames to compute per-core usage percentages.
+- **NVML dynamic loading**: Loads `libnvidia-ml.so.1` via `dlopen`/`dlsym` at runtime. Uses a variadic LOAD macro to try versioned symbols first (e.g. `nvmlInit_v2` before `nvmlInit`). All NVML function pointers are prefixed with `p` (e.g. `pNvmlInit`).
+- **CPU sampling**: Reads `/proc/stat` delta between collection cycles to compute per-core usage percentages.
 - **Memory**: Parses `/proc/meminfo` for used/available/buffers/cached/swap.
-- **CPU thermals/freq**: Reads from `/sys/class/thermal/` and `/sys/devices/system/cpu/`.
-- **GPU process info**: Queries both compute and graphics process lists via NVML, resolves PID to command name and user via `/proc/<pid>/`.
-- **TUI rendering**: ncursesw (wide character support) with color pairs (1=red/critical, 2=green/normal, 3=yellow/medium, 6=cyan/headers). `draw_screen()` is the main render function.
-- **History chart**: Ring buffer of last 20 CPU/GPU samples, rendered as full-width vertical bar chart using Unicode block elements (▁▂▃▄▅▆▇█).
-- **Prometheus exporter**: Opt-in via `-p PORT`. Runs a minimal HTTP server on a dedicated pthread, serving OpenMetrics-formatted metrics at `/metrics`. Uses POSIX sockets with `poll()` for clean shutdown. Zero overhead when not enabled. Enables multi-machine monitoring via Prometheus/Grafana.
+- **CPU thermals/freq**: Reads per-thermal-zone temps via `read_thermal_zones()` from `/sys/class/thermal/` and per-core frequencies from `/sys/devices/system/cpu/`.
+- **Prometheus exporter**: A minimal HTTP server on a dedicated pthread, serving OpenMetrics-formatted metrics at `/metrics`. Uses POSIX sockets with `poll()` for clean shutdown. `-p PORT` is required; the main loop collects at the `-r MS` interval (default 1000, floor 250) and the scrape path re-reads fresh sensor data per request. Enables multi-machine monitoring via Prometheus/Grafana.
 
 ## Memory allocation (CRITICAL — do not add runtime allocations)
 
@@ -41,25 +38,22 @@ All memory is allocated once at startup, sized to the detected hardware. **Zero 
 - CPU arrays are dynamically sized to `sysconf(_SC_NPROCESSORS_CONF)` at startup
 - GPU arrays are sized to `gpu_count` from NVML at startup
 - Prometheus buffers are pre-allocated when the server thread starts
-- The `compute_cpu_usage()`, `draw_screen()`, and `format_metrics()` functions must NEVER call malloc/calloc/realloc
+- The `compute_cpu_usage()` and `format_metrics()` functions must NEVER call malloc/calloc/realloc
 
 If you need to add new data collection, allocate the buffer at startup alongside the existing arrays — not in the hot path. Run `./soak-test.sh 10` after any changes to verify RSS stability.
 
 ## Locale / decimal separator (CRITICAL for Prometheus)
 
-The Prometheus exposition format **requires** decimal points (`1.23`), never commas (`1,23`). The TUI needs `setlocale(LC_ALL, "")` for Unicode support (ncursesw), but on systems with non-English locales (e.g. `es_ES.UTF-8`), `printf("%.2f")` produces commas, which causes Prometheus scrape parse errors (`up=0`).
+The Prometheus exposition format **requires** decimal points (`1.23`), never commas (`1,23`). On systems with non-English locales (e.g. `es_ES.UTF-8`), `printf("%.2f")` can produce commas, which causes Prometheus scrape parse errors (`up=0`).
 
-**Fix in code** (line ~1757): After `setlocale(LC_ALL, "")`, the code calls `setlocale(LC_NUMERIC, "C")` to force POSIX decimal formatting while preserving Unicode support for the TUI. This is the authoritative fix — it works regardless of the system locale or systemd environment.
-
-**Defense in depth**: The systemd service file also sets `Environment="LC_ALL=C"` as a belt-and-suspenders safeguard, but the code fix alone is sufficient.
+**Fix in code**: `main()` calls `setlocale(LC_NUMERIC, "C")` to force POSIX decimal formatting. Do **not** call `setlocale(LC_ALL, "")` or any other locale — nothing in the program needs the user locale, and it would reintroduce the comma problem.
 
 **Do not remove** the `setlocale(LC_NUMERIC, "C")` call. Any future code that formats floats for Prometheus output depends on it.
 
 ## DGX Spark specifics
 
-- The GB10 GPU uses **unified memory** shared with the Grace CPU. `nvmlDeviceGetMemoryInfo` returns NOT_SUPPORTED — the code detects this and shows "unified memory" instead of a VRAM bar.
+- The GB10 GPU uses **unified memory** shared with the Grace CPU. `nvmlDeviceGetMemoryInfo` returns NOT_SUPPORTED — the code detects this and omits GPU memory metrics instead of showing zeros.
 - Target arch is **aarch64**. NVML library paths include both aarch64 and x86_64 fallbacks.
 - No fan speed sensor on GB10 (handled gracefully via return code check).
-- **Grace CPU is big.LITTLE**: 10x Cortex-X925 (performance, 3.9 GHz) + 10x Cortex-X725 (efficiency, 2.8 GHz). Core types are identified via ARM CPU part IDs in `/proc/cpuinfo` (`0xd85` = X925, `0xd87` = X725) and shown per-core in the TUI.
-- DGX Spark ships with `performance` cpufreq governor (cores pinned to max). Per-core frequency display is not shown since it's static, but if future hardware (e.g. DGX 300) uses dynamic governors, per-core freq could be read from `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq`.
+- **Grace CPU is big.LITTLE**: 10x Cortex-X925 (performance, 3.9 GHz) + 10x Cortex-X725 (efficiency, 2.8 GHz). Core types are identified via ARM CPU part IDs in `/proc/cpuinfo` (`0xd85` = X925, `0xd87` = X725) and exposed as the per-core `type` label in Prometheus.
 - When HugePages are active, `MemAvailable` is inaccurate — the code uses `HugePages_Free * Hugepagesize` instead (per NVIDIA known-issues docs).

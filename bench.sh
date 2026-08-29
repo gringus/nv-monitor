@@ -60,8 +60,7 @@ echo "--- Measurements (${DURATION}s sample) ---"
 echo ""
 
 if [ -x "$NV_MONITOR" ]; then
-    measure "nv-monitor (headless)" "$NV_MONITOR" -n -l /dev/null
-    measure "nv-monitor (headless+prometheus)" "$NV_MONITOR" -n -l /dev/null -p 9198
+    measure "nv-monitor (prometheus exporter)" "$NV_MONITOR" -p 9198
 fi
 
 if command -v top &>/dev/null; then
@@ -77,7 +76,7 @@ fi
 echo ""
 echo "--- NVML memory breakdown ---"
 if [ -x "$NV_MONITOR" ]; then
-    "$NV_MONITOR" -n -l /dev/null &>/dev/null &
+    "$NV_MONITOR" -p 9198 &>/dev/null &
     NV_PID=$!
     sleep 2
     echo "NVML mapped regions:"

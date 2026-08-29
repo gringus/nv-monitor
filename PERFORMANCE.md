@@ -95,7 +95,7 @@ This is a deliberate design choice for a long-running monitoring tool. There is 
 | `prom_body` (HTTP response buffer) | `gpu_count + num_cpus` | Prometheus thread start | Thread exit |
 | `prom_gpus` (GPU snapshot array) | `gpu_count` | Prometheus thread start | Thread exit |
 
-**Functions that execute per-frame (every 1s):** `compute_cpu_usage()`, `draw_screen()`, `log_csv_row()` — zero allocations.
+**Functions that execute per collection cycle (every 1s):** `compute_cpu_usage()`, `read_net_totals()`, `read_rdma_ports()` — zero allocations.
 
 **Functions that execute per-scrape (every 15-30s):** `format_metrics()`, `prom_handle()` — zero allocations, reuse pre-allocated buffers.
 

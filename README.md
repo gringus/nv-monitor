@@ -1,79 +1,17 @@
 # nv-monitor
 
-Local monitoring TUI and Prometheus/OpenMetrics exporter for NVIDIA GPU systems — all in a single <80KB binary with zero runtime dependencies. Built for the **DGX Spark** (Grace + GB10), works on any Linux system with an NVIDIA GPU.
+Prometheus/OpenMetrics exporter for NVIDIA GPU systems — a single <80KB binary with zero runtime dependencies. Built for the **DGX Spark** (Grace + GB10), works on any Linux system with an NVIDIA GPU.
 
 Accurately monitor a single machine or an entire cluster with minimal overhead. Reports metrics to NVIDIA specifications via NVML, with correct handling of unified memory, HugePages, and ARM big.LITTLE core topology. Includes `demo-load`, a zero-dependency synthetic CPU/GPU load generator for validating your monitoring pipeline end-to-end.
 
 ![C](https://img.shields.io/badge/lang-C-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Arch](https://img.shields.io/badge/arch-aarch64%20%7C%20x86__64-orange) ![Build](https://github.com/wentbackward/nv-monitor/actions/workflows/build.yml/badge.svg)
 
-## Display
+## Design
 
-### CPU Section
-- **Overall** aggregate usage bar across all cores
-- **Per-core** usage bars in dual-column layout with ARM core type labels (**X925** = performance cores at 3.9 GHz, **X725** = efficiency cores at 2.8 GHz on the Grace big.LITTLE architecture)
-- CPU frequency
-
-### Memory Section
-- **Used** (green) — actual application memory (total - free - buffers - cached)
-- **Buf/cache** (blue) — kernel buffers and page cache (reclaimable)
-- Swap usage bar
-- Correctly handles **HugePages** on DGX Spark where `MemAvailable` is inaccurate
-
-### GPU Section
-- **GPU utilization** bar with temperature, power draw (watts), and clock speed
-- **VRAM** bar, or "unified memory" label on DGX Spark where CPU/GPU share memory
-- **ENC/DEC** — hardware video encoder (NVENC) and decoder (NVDEC) utilization percentage
-
-### GPU Processes
-- **PID** — process ID
-- **USER** — process owner
-- **TYPE** — **C** (Compute: CUDA/inference workloads) or **G** (Graphics: rendering, e.g. Xorg)
-- **CPU%** — per-process CPU usage (delta-based, per-core scale)
-- **GPU MEM** — GPU memory allocated by the process
-- **COMMAND** — binary name with arguments
-- **(other processes)** — summary row showing CPU usage from non-GPU processes
-
-### History Chart
-- Full-width rolling graph of CPU (green) and GPU (cyan) utilization over the last 20 samples using Unicode block elements (▁▂▃▄▅▆▇█)
-
-### General
-- Color-coded bars: green (normal), yellow (>60%), red (>90%)
-- **Headless Mode** — run without TUI for unattended data collection
-- 1s default refresh, adjustable at runtime or via CLI
+- Collects at a 1s default interval, adjustable via CLI (`-r`)
 - NVML loaded dynamically at runtime — no hard dependency on NVIDIA drivers
-
-<table>
-<tr>
-<td><strong>aarch64</strong> (DGX Spark — Grace + GB10)</td>
-<td><strong>x86_64</strong> (Laptop — Ryzen 7 + RTX 3050)</td>
-<td><strong>arm64</strong> (Jetson Orin Nano)</td>
-</tr>
-<tr>
-<td><img src="screenshots/nv-monitor-arm.png" alt="nv-monitor on ARM"></td>
-<td><img src="screenshots/nv-monitor-x86.png" alt="nv-monitor on x86"></td>
-<td><img src="screenshots/nv-monitor-jetson.png" alt="nv-monitor on Jetson"></td>
-</tr>
-</table>
-<table>
-<tr>
-<td><strong>PowerEdge XE9680</strong> (H100 Datacenter Grade)</td>
-<td><strong>GB200</strong> (Datacenter Grade)</td>
-<td><strong>GB200</strong> (Datacenter Grade)</td>
-</tr>
-<tr>
-<td><img src="screenshots/poweredge-xe9680-H100.png" alt="nv-monitor on PowerEdge XE9680 with H100"></td>
-<td><img src="screenshots/GB200-2.png" alt="nv-monitor on GB200"></td>
-<td><img src="screenshots/GB200.png" alt="nv-monitor on GB200"></td>
-</tr>
-</table>
-<table>
-<tr>
-<td><strong>PowerEdge XE9680</strong> (H100 Datacenter Grade) - Compact View</td>
-</tr>
-<tr>
-<td><img src="screenshots/poweredge-xe9680-H100.png" alt="nv-monitor on ARM"></td>
-</tr>
-</table>
+- Correctly handles **HugePages** on DGX Spark where `MemAvailable` is inaccurate
+- Reports metrics to NVIDIA specifications via NVML, with correct handling of unified memory and ARM big.LITTLE core topology (per-core `type` labels: **X925** performance / **X725** efficiency on Grace)
 
 ## Download
 
@@ -89,20 +27,18 @@ pacman -S nv-monitor
 
 ## Building
 
-Requires `gcc` and `libncurses-dev`:
+Requires `gcc`:
 
 ```bash
-sudo apt install build-essential libncurses-dev
+sudo apt install build-essential
 make
 ```
 
 ## Usage
 
 ```bash
-./nv-monitor                           # TUI only
-./nv-monitor -r 2000                   # TUI refreshing every 2s
-./nv-monitor -p 9101                   # TUI + Prometheus metrics on :9101
-./nv-monitor -n -p 9101                # Headless Prometheus exporter
+./nv-monitor -p 9101                   # Prometheus metrics on :9101
+./nv-monitor -p 9101 -r 2000           # Collect every 2s
 ```
 
 Or install system-wide:
@@ -113,35 +49,20 @@ sudo make install
 
 ### Command-line options
 
-| Flag      | Description                                | Default |
-|-----------|--------------------------------------------|---------|
-| `-c COLS` | CPU display columns (1-4, 0=auto)          | auto    |
-| `-n`      | Headless mode (no TUI, requires `-p`)      | off     |
-| `-p PORT` | Expose Prometheus metrics on PORT          | off     |
-| `-t TOKEN`| Require Bearer token for `/metrics`        | off     |
-| `-r MS`   | UI refresh interval in milliseconds        | 1000    |
-| `-v`      | Show version                               |         |
-| `-h`      | Show help                                  |         |
-
-### Interactive controls
-
-| Key         | Action                                       |
-|-------------|----------------------------------------------|
-| `q`/Esc     | Quit                                         |
-| `s`         | Toggle sort (GPU memory / PID)               |
-| `c`         | Cycle CPU column count (auto → 1 → 2 → 3 → 4)|
-| `j`/`k` or ↑/↓ | Scroll CPU cores when they exceed the viewport |
-| `+`/`-`     | Adjust refresh rate (250ms steps)            |
-
-The CPU section auto-selects the column count based on terminal width and adapts on resize. When cores exceed the available vertical space, a scroll indicator `[first-last] ↑↓` appears on the CPU header line. Use `-c N` to override the auto column count at startup.
+| Flag       | Description                                | Default |
+|------------|--------------------------------------------|---------|
+| `-p PORT`  | Expose Prometheus metrics on PORT          | required |
+| `-t TOKEN` | Require Bearer token for `/metrics`        | off     |
+| `-r MS`    | Collection interval in milliseconds        | 1000    |
+| `-v`       | Show version                               |         |
+| `-h`       | Show help                                  |         |
 
 ## Prometheus Metrics
 
-Pass `-p PORT` to expose a Prometheus-compatible metrics endpoint:
+`-p PORT` exposes a Prometheus-compatible metrics endpoint:
 
 ```bash
-./nv-monitor -p 9101              # TUI + metrics at http://localhost:9101/metrics
-./nv-monitor -n -p 9101           # Pure headless exporter
+./nv-monitor -p 9101              # metrics at http://localhost:9101/metrics
 curl -s localhost:9101/metrics     # Check it works
 ```
 
@@ -209,7 +130,7 @@ This keeps the binary small, dependency-free, and composable with existing infra
 
 ## Synthetic Load Testing
 
-A companion tool `demo-load` generates sinusoidal CPU and GPU loads for visual testing and multi-node validation — no bulky benchmarking tools required. See [DEMO-LOAD.md](DEMO-LOAD.md) for details.
+A companion tool `demo-load` generates sinusoidal CPU and GPU loads for testing and multi-node validation — no bulky benchmarking tools required. See [DEMO-LOAD.md](DEMO-LOAD.md) for details.
 
 ```bash
 make demo-load
@@ -219,7 +140,6 @@ make demo-load
 ## Requirements
 
 - Linux (reads from `/proc` and `/sys`)
-- ncurses (TUI mode)
 - NVIDIA drivers with NVML (for GPU monitoring — CPU/memory work without it)
 
 ### Platform support
@@ -227,11 +147,11 @@ make demo-load
 | Platform | Status |
 |----------|--------|
 | DGX Spark (aarch64, Grace + GB10) | Primary target — full support including unified memory, HugePages, big.LITTLE core labels |
-| GB200 NVL (aarch64, up to 208 GPUs) | Supported — dynamic allocation scales to any CPU/GPU count, scrollable TUI |
+| GB200 NVL (aarch64, up to 208 GPUs) | Supported — dynamic allocation scales to any CPU/GPU count |
 | Dell PowerEdge XE9680 (x86_64, 8x H100) | Tested — 112 cores, 8 GPUs with VRAM, multi-GPU Prometheus export |
 | Jetson Orin (Nano / NX / AGX) | GPU via Tegra sysfs, A78AE core labels, legacy glibc binary available |
-| Any Linux + NVIDIA GPU (x86_64) | Fully supported — CPU, memory, GPU, processes, Prometheus exporter |
-| Linux without NVIDIA GPU | CPU and memory monitoring only, GPU section shows "NVML not available" |
+| Any Linux + NVIDIA GPU (x86_64) | Fully supported — CPU, memory, GPU Prometheus exporter |
+| Linux without NVIDIA GPU | CPU and memory metrics only, no GPU metrics |
 | RDMA / InfiniBand | Community-verified on real hardware — auto-detected via `/sys/class/infiniband/`, feedback welcome |
 
 ### A note on RDMA and cross-node bandwidth

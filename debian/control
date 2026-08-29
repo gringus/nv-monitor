@@ -3,10 +3,10 @@ Version: __VERSION__
 Section: utils
 Priority: optional
 Architecture: __PKG_ARCH__
-Depends: libc6 (>= 2.32), libncurses6 (>= 6.0)
+Depends: libc6 (>= 2.32)
 Maintainer: __MAINTAINER__
-Description: NVIDIA DGX system monitor (TUI)
- nv-monitor is a single-file terminal system monitor for the NVIDIA
- DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It combines CPU,
- memory, and GPU monitoring in one ncurses TUI, with optional Prometheus
- export and CSV logging.
+Description: NVIDIA DGX Prometheus exporter
+ nv-monitor is a single-file Prometheus exporter for the NVIDIA
+ DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It exposes CPU,
+ memory, GPU, NIC, and RDMA metrics over HTTP for Prometheus
+ scraping.

@@ -3,8 +3,7 @@
 A lightweight test harness for validating nv-monitor across single machines or multi-node clusters. Generates controllable, sinusoidal CPU and GPU loads with zero dependencies beyond a C compiler and NVIDIA drivers.
 
 Useful for:
-- **End-to-end testing** of nv-monitor TUI, CSV logging, and Prometheus pipelines
-- **Visual health-checks** — verify bars, colors, and history charts are rendering correctly
+- **End-to-end testing** of nv-monitor's Prometheus pipeline
 - **Multi-node validation** — run on every box in a cluster without installing bulky benchmarking tools
 
 ## Building
@@ -78,7 +77,7 @@ Run demo-load on each node while nv-monitor exports Prometheus metrics:
 ```bash
 # On each node:
 ./demo-load --gpu &
-./nv-monitor -n -p 9101
+./nv-monitor -p 9101
 ```
 
 Then scrape all nodes from Prometheus and verify metrics flow end-to-end through to Grafana — without deploying real workloads.
