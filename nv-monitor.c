@@ -1224,9 +1224,6 @@ int main(int argc, char *argv[]) {
     if (nvml_ok && pNvmlDeviceGetCount)
         pNvmlDeviceGetCount(&gpu_count);
 
-    /* Read CPU core part IDs (for type labels in Prometheus) */
-    read_cpu_part_ids();
-
     /* Detect Tegra GPU sysfs (Jetson fallback) */
     detect_tegra_gpu();
     detect_nic_asic_sensors();
@@ -1247,6 +1244,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to allocate CPU arrays for %d cores\n", max_cpus);
         return 1;
     }
+
+    /* Read CPU core part IDs (for type labels in Prometheus) */
+    read_cpu_part_ids();
 
     /* Initial CPU tick read (baseline for the first scrape's usage delta) */
     read_cpu_ticks(prev_ticks, &num_cpus);
