@@ -1,6 +1,6 @@
 # nv-monitor
 
-Local monitoring TUI, CSV logger, and Prometheus/OpenMetrics exporter for NVIDIA GPU systems — all in a single <80KB binary with zero runtime dependencies. Built for the **DGX Spark** (Grace + GB10), works on any Linux system with an NVIDIA GPU.
+Local monitoring TUI and Prometheus/OpenMetrics exporter for NVIDIA GPU systems — all in a single <80KB binary with zero runtime dependencies. Built for the **DGX Spark** (Grace + GB10), works on any Linux system with an NVIDIA GPU.
 
 Accurately monitor a single machine or an entire cluster with minimal overhead. Reports metrics to NVIDIA specifications via NVML, with correct handling of unified memory, HugePages, and ARM big.LITTLE core topology. Includes `demo-load`, a zero-dependency synthetic CPU/GPU load generator for validating your monitoring pipeline end-to-end.
 
@@ -11,7 +11,7 @@ Accurately monitor a single machine or an entire cluster with minimal overhead. 
 ### CPU Section
 - **Overall** aggregate usage bar across all cores
 - **Per-core** usage bars in dual-column layout with ARM core type labels (**X925** = performance cores at 3.9 GHz, **X725** = efficiency cores at 2.8 GHz on the Grace big.LITTLE architecture)
-- CPU temperature (highest thermal zone) and frequency
+- CPU frequency
 
 ### Memory Section
 - **Used** (green) — actual application memory (total - free - buffers - cached)
@@ -38,7 +38,6 @@ Accurately monitor a single machine or an entire cluster with minimal overhead. 
 
 ### General
 - Color-coded bars: green (normal), yellow (>60%), red (>90%)
-- **CSV Logging** — log all stats to file with configurable interval
 - **Headless Mode** — run without TUI for unattended data collection
 - 1s default refresh, adjustable at runtime or via CLI
 - NVML loaded dynamically at runtime — no hard dependency on NVIDIA drivers
@@ -101,9 +100,6 @@ make
 
 ```bash
 ./nv-monitor                           # TUI only
-./nv-monitor -l stats.csv              # TUI + log every 1s
-./nv-monitor -l stats.csv -i 5000      # TUI + log every 5s
-./nv-monitor -n -l stats.csv -i 500    # Headless, log every 500ms
 ./nv-monitor -r 2000                   # TUI refreshing every 2s
 ./nv-monitor -p 9101                   # TUI + Prometheus metrics on :9101
 ./nv-monitor -n -p 9101                # Headless Prometheus exporter
@@ -120,9 +116,7 @@ sudo make install
 | Flag      | Description                                | Default |
 |-----------|--------------------------------------------|---------|
 | `-c COLS` | CPU display columns (1-4, 0=auto)          | auto    |
-| `-l FILE` | Log statistics to CSV file                 | off     |
-| `-i MS`   | Log interval in milliseconds               | 1000    |
-| `-n`      | Headless mode (no TUI, requires `-l`/`-p`) | off     |
+| `-n`      | Headless mode (no TUI, requires `-p`)      | off     |
 | `-p PORT` | Expose Prometheus metrics on PORT          | off     |
 | `-t TOKEN`| Require Bearer token for `/metrics`        | off     |
 | `-r MS`   | UI refresh interval in milliseconds        | 1000    |
@@ -159,7 +153,7 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_uptime_seconds` | gauge | | System uptime |
 | `nv_load_average` | gauge | `interval` | Load average (1m, 5m, 15m) |
 | `nv_cpu_usage_percent` | gauge | `cpu`, `type` | Per-core CPU utilization (type = ARM core: X925, X725, etc.) |
-| `nv_cpu_temperature_celsius` | gauge | | CPU temperature |
+| `nv_thermal_zone_temperature_celsius` | gauge | `zone`, `type` | Per-thermal-zone temperature (e.g. cpu-therm, GPU-therm) |
 | `nv_cpu_frequency_mhz` | gauge | | CPU frequency |
 | `nv_memory_total_bytes` | gauge | | Total system memory |
 | `nv_memory_used_bytes` | gauge | | Application memory used |
@@ -234,7 +228,7 @@ make demo-load
 |----------|--------|
 | DGX Spark (aarch64, Grace + GB10) | Primary target — full support including unified memory, HugePages, big.LITTLE core labels |
 | GB200 NVL (aarch64, up to 208 GPUs) | Supported — dynamic allocation scales to any CPU/GPU count, scrollable TUI |
-| Dell PowerEdge XE9680 (x86_64, 8x H100) | Tested — 112 cores, 8 GPUs with VRAM, multi-GPU CSV/Prometheus export |
+| Dell PowerEdge XE9680 (x86_64, 8x H100) | Tested — 112 cores, 8 GPUs with VRAM, multi-GPU Prometheus export |
 | Jetson Orin (Nano / NX / AGX) | GPU via Tegra sysfs, A78AE core labels, legacy glibc binary available |
 | Any Linux + NVIDIA GPU (x86_64) | Fully supported — CPU, memory, GPU, processes, Prometheus exporter |
 | Linux without NVIDIA GPU | CPU and memory monitoring only, GPU section shows "NVML not available" |

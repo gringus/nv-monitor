@@ -14,7 +14,6 @@ DURATION_MIN=${1:-10}
 DURATION_SEC=$((DURATION_MIN * 60))
 NV_MONITOR="./nv-monitor"
 PROM_PORT=9177
-LOG_FILE="/tmp/soak-test-data.csv"
 SCRAPE_INTERVAL=0.5  # seconds between prometheus scrapes
 RSS_SAMPLE_INTERVAL=5  # seconds between RSS samples
 
@@ -22,9 +21,7 @@ echo "========================================"
 echo " nv-monitor soak test"
 echo "========================================"
 echo " Duration:  ${DURATION_MIN} minutes"
-echo " Log file:  ${LOG_FILE}"
 echo " Prom port: ${PROM_PORT}"
-echo " Log interval: 100ms (maximum collection rate)"
 echo " Scrape interval: ${SCRAPE_INTERVAL}s"
 echo "========================================"
 echo ""
@@ -35,12 +32,11 @@ cleanup() {
     echo "Stopping..."
     kill $NV_PID $SCRAPER_PID 2>/dev/null
     wait $NV_PID $SCRAPER_PID 2>/dev/null
-    rm -f "$LOG_FILE"
 }
 trap cleanup EXIT
 
-# Start nv-monitor: headless, fastest logging, prometheus enabled
-"$NV_MONITOR" -n -l "$LOG_FILE" -i 100 -p $PROM_PORT &>/dev/null &
+# Start nv-monitor: headless at fastest refresh (250ms floor), prometheus enabled
+"$NV_MONITOR" -n -r 250 -p $PROM_PORT &>/dev/null &
 NV_PID=$!
 sleep 2
 
@@ -66,8 +62,8 @@ echo ""
 SCRAPER_PID=$!
 
 # Monitor RSS over time
-echo "Time       RSS (KB)    CSV lines   Prom scrapes   Delta RSS"
-echo "---------- ----------- ----------- -------------- ---------"
+echo "Time       RSS (KB)    Prom scrapes   Delta RSS"
+echo "---------- ----------- -------------- ---------"
 
 SCRAPE_COUNT=0
 START_TIME=$(date +%s)
@@ -85,7 +81,6 @@ while true; do
     fi
 
     RSS_NOW=$(grep VmRSS /proc/$NV_PID/status 2>/dev/null | awk '{print $2}')
-    CSV_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
     # Count prometheus scrapes (approximate from curl loop)
     SCRAPE_COUNT=$(echo "$ELAPSED / $SCRAPE_INTERVAL" | bc 2>/dev/null || echo "?")
@@ -94,8 +89,8 @@ while true; do
     MINS=$((ELAPSED / 60))
     SECS=$((ELAPSED % 60))
 
-    printf "%3dm %02ds    %-11s %-11s %-14s %+d KB\n" \
-        $MINS $SECS "$RSS_NOW" "$CSV_LINES" "$SCRAPE_COUNT" "$DELTA"
+    printf "%3dm %02ds    %-11s %-14s %+d KB\n" \
+        $MINS $SECS "$RSS_NOW" "$SCRAPE_COUNT" "$DELTA"
 
     sleep $RSS_SAMPLE_INTERVAL
 done
@@ -106,15 +101,11 @@ echo "========================================"
 echo " Results after ${DURATION_MIN} minutes"
 echo "========================================"
 RSS_END=$(grep VmRSS /proc/$NV_PID/status 2>/dev/null | awk '{print $2}')
-CSV_FINAL=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-CSV_SIZE=$(du -h "$LOG_FILE" 2>/dev/null | awk '{print $1}')
 DELTA=$((RSS_END - RSS_START))
 
 echo "RSS start:      ${RSS_START} KB"
 echo "RSS end:        ${RSS_END} KB"
 echo "RSS delta:      ${DELTA} KB"
-echo "CSV rows:       ${CSV_FINAL}"
-echo "CSV size:       ${CSV_SIZE}"
 echo "Prom scrapes:   ~$((DURATION_SEC * 2))"
 echo ""
 

@@ -17,9 +17,11 @@ demo-load: demo-load.c
 portable:
 	$(CC) $(CFLAGS_PORTABLE) -o $(TARGET) nv-monitor.c $(LDFLAGS)
 
-test: test_meminfo.c
+test: test_meminfo.c test_thermal.c
 	$(CC) -O0 -Wall -Wextra -o test_meminfo test_meminfo.c
 	./test_meminfo
+	$(CC) -O0 -Wall -Wextra -o test_thermal test_thermal.c
+	./test_thermal
 
 lint:
 	@echo "Running cppcheck..."
@@ -28,7 +30,7 @@ lint:
 	clang-tidy-20 nv-monitor.c -- --std=gnu11 -lncursesw -ldl -lpthread -Wall -Wextra
 
 clean:
-	rm -f $(TARGET) demo-load test_meminfo
+	rm -f $(TARGET) demo-load test_meminfo test_thermal
 
 install: $(TARGET)
 	install -d $(PREFIX)/bin

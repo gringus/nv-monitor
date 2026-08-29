@@ -32,17 +32,16 @@ Everything is in `nv-monitor.c` (~1640 lines). Key sections:
 - **GPU process info**: Queries both compute and graphics process lists via NVML, resolves PID to command name and user via `/proc/<pid>/`.
 - **TUI rendering**: ncursesw (wide character support) with color pairs (1=red/critical, 2=green/normal, 3=yellow/medium, 6=cyan/headers). `draw_screen()` is the main render function.
 - **History chart**: Ring buffer of last 20 CPU/GPU samples, rendered as full-width vertical bar chart using Unicode block elements (▁▂▃▄▅▆▇█).
-- **CSV logging**: Opt-in via `-l FILE`, writes timestamped rows with all CPU/memory/GPU metrics. Shares derived calculations with the TUI via `meminfo_calc()`.
 - **Prometheus exporter**: Opt-in via `-p PORT`. Runs a minimal HTTP server on a dedicated pthread, serving OpenMetrics-formatted metrics at `/metrics`. Uses POSIX sockets with `poll()` for clean shutdown. Zero overhead when not enabled. Enables multi-machine monitoring via Prometheus/Grafana.
 
 ## Memory allocation (CRITICAL — do not add runtime allocations)
 
-All memory is allocated once at startup, sized to the detected hardware. **Zero allocations occur in any per-frame, per-log, or per-scrape code path.** This is a long-running application that must run for weeks with no memory growth.
+All memory is allocated once at startup, sized to the detected hardware. **Zero allocations occur in any per-frame or per-scrape code path.** This is a long-running application that must run for weeks with no memory growth.
 
 - CPU arrays are dynamically sized to `sysconf(_SC_NPROCESSORS_CONF)` at startup
 - GPU arrays are sized to `gpu_count` from NVML at startup
 - Prometheus buffers are pre-allocated when the server thread starts
-- The `compute_cpu_usage()`, `draw_screen()`, `log_csv_row()`, and `format_metrics()` functions must NEVER call malloc/calloc/realloc
+- The `compute_cpu_usage()`, `draw_screen()`, and `format_metrics()` functions must NEVER call malloc/calloc/realloc
 
 If you need to add new data collection, allocate the buffer at startup alongside the existing arrays — not in the hot path. Run `./soak-test.sh 10` after any changes to verify RSS stability.
 
@@ -54,7 +53,7 @@ The Prometheus exposition format **requires** decimal points (`1.23`), never com
 
 **Defense in depth**: The systemd service file also sets `Environment="LC_ALL=C"` as a belt-and-suspenders safeguard, but the code fix alone is sufficient.
 
-**Do not remove** the `setlocale(LC_NUMERIC, "C")` call. Any future code that formats floats for Prometheus or CSV output depends on it.
+**Do not remove** the `setlocale(LC_NUMERIC, "C")` call. Any future code that formats floats for Prometheus output depends on it.
 
 ## DGX Spark specifics
 

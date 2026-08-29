@@ -94,6 +94,8 @@ static char  host_name[256] = "";       /* local hostname, shortened before firs
 #define BAR_CHAR_FULL  ACS_BLOCK
 #define COLOR_GRAY     8
 #define HISTORY_LEN   20
+#define MAX_THERMAL_ZONES 20
+#define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c overrides this */
 
 /* ── CPU state (dynamically allocated at startup) ──────────────────── */
 
@@ -212,32 +214,7 @@ static int cpu_scroll  = 0;  /* first visible core row offset */
 static int skip_history_once = 0; /* suppress history chart for one frame after resize */
 static int gpu_view = 0;  /* 0=auto, 1=compact, 2=detailed */
 
-/* ── Windowed peak tracking (peak within a 30-minute window) ───────── */
-
-typedef struct {
-    double peak;
-    time_t  ts;
-} WindowedPeak;
-
-#define PEAK_WINDOW_SECS 1800  /* 30 minutes */
-
-static WindowedPeak peak_cpu_pct;
-static WindowedPeak peak_cpu_temp_c;
-static WindowedPeak *peak_gpu_util;     /* [gpu_count] */
-static WindowedPeak *peak_gpu_temp_c;   /* [gpu_count] */
-static WindowedPeak *peak_gpu_power_mw; /* [gpu_count] */
-
-static void update_windowed_peak(WindowedPeak *p, double value) {
-    time_t now = time(NULL);
-    if (now - p->ts > PEAK_WINDOW_SECS || value > p->peak) {
-        p->peak = value;
-        p->ts = now;
-    }
-}
-
 /* Command-line options */
-static FILE *log_fp = NULL;
-static int   log_interval_ms = 1000;
 static int   no_ui = 0;
 static int   prom_port = 0;  /* Prometheus metrics port (0 = disabled) */
 static const char *prom_token = NULL; /* Bearer token for /metrics auth */
@@ -501,24 +478,6 @@ static void read_meminfo(MemInfo *m) {
     meminfo_calc(m);
 }
 
-/* ── CPU thermals ───────────────────────────────────────────────────── */
-
-static int read_cpu_temp(void) {
-    /* Find highest thermal zone temp */
-    int max_temp = 0;
-    for (int i = 0; i < 20; i++) {
-        char path[128];
-        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
-        FILE *f = fopen(path, "r");
-        if (!f) break;
-        int t = 0;
-        if (fscanf(f, "%d", &t) == 1 && t > max_temp)
-            max_temp = t;
-        fclose(f);
-    }
-    return max_temp / 1000; /* millidegrees to degrees */
-}
-
 /* ── CPU frequency ──────────────────────────────────────────────────── */
 
 static void read_cpu_freqs(void) {
@@ -584,7 +543,7 @@ static void detect_tegra_gpu(void) {
     }
 
     /* Find GPU thermal zone */
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
         char path[128], type[64] = "";
         snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", i);
         FILE *f = fopen(path, "r");
@@ -1148,109 +1107,6 @@ static RdmaPort rdma_ports[MAX_RDMA_PORTS];
 static int       rdma_count = 0;
 static int       rdma_available = 0;
 
-/* ── CSV logging ────────────────────────────────────────────────────── */
-
-static void log_csv_header(FILE *f) {
-    fprintf(f, "timestamp,cpu_avg_pct");
-    for (int i = 1; i <= num_cpus; i++)
-        fprintf(f, ",cpu%d_pct", i - 1);
-    fprintf(f, ",cpu_temp_c,cpu_freq_mhz");
-    for (int i = 1; i <= num_cpus; i++)
-        fprintf(f, ",cpu%d_freq_mhz", i - 1);
-    fprintf(f, ",mem_used_kb,mem_total_kb,mem_bufcache_kb");
-    fprintf(f, ",swap_used_kb,swap_total_kb");
-    fprintf(f, ",net_rx_Bps,net_tx_Bps,nic_asic_temp_c");
-    for (unsigned int g = 0; g < gpu_count; g++)
-        fprintf(f, ",gpu%u_util_pct,gpu%u_temp_c,gpu%u_power_mw,gpu%u_clock_mhz", g, g, g, g);
-    /* Windowed peaks (30-minute window) */
-    fprintf(f, ",peak_30m_cpu_pct,peak_30m_cpu_temp_c");
-    for (unsigned int g = 0; g < gpu_count; g++)
-        fprintf(f, ",peak_30m_gpu%u_util_pct,peak_30m_gpu%u_temp_c,peak_30m_gpu%u_power_w", g, g, g);
-    for (int i = 0; i < rdma_count; i++)
-        fprintf(f, ",rdma_%s_p%d_xmit_Bps,rdma_%s_p%d_recv_Bps",
-                rdma_ports[i].device, rdma_ports[i].port,
-                rdma_ports[i].device, rdma_ports[i].port);
-    fprintf(f, "\n");
-    fflush(f);
-}
-
-static void log_csv_row(FILE *f) {
-    /* Timestamp */
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
-    fprintf(f, "%04d-%02d-%02dT%02d:%02d:%02d.%03ld",
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
-
-    /* CPU */
-    fprintf(f, ",%.1f", cpu_pct[0]);
-    for (int i = 1; i <= num_cpus; i++)
-        fprintf(f, ",%.1f", cpu_pct[i]);
-
-    read_cpu_freqs();
-    fprintf(f, ",%d,%d", read_cpu_temp(), cpu_freq_mhz[0]);
-    for (int i = 1; i <= num_cpus; i++)
-        fprintf(f, ",%d", cpu_freq_mhz[i]);
-
-    /* Memory */
-    MemInfo mi;
-    read_meminfo(&mi);
-    fprintf(f, ",%llu,%llu,%llu", mi.app_kb, mi.total_kb, mi.bufcache_kb);
-    fprintf(f, ",%llu,%llu", mi.swap_used_kb, mi.swap_total_kb);
-    fprintf(f, ",%.0f,%.0f,%d", net_totals.rx_bytes_sec, net_totals.tx_bytes_sec,
-            read_nic_asic_temp());
-
-    /* GPU */
-    for (unsigned int g = 0; g < gpu_count; g++) {
-        nvmlDevice_t dev;
-        if (pNvmlDeviceGetHandleByIndex(g, &dev) == NVML_SUCCESS) {
-            nvmlUtilization_t util = {0};
-            if (!use_tegra_gpu && pNvmlDeviceGetUtilizationRates)
-                pNvmlDeviceGetUtilizationRates(dev, &util);
-            if (use_tegra_gpu) {
-                int tutil = read_tegra_gpu_util();
-                if (tutil >= 0) util.gpu = (unsigned int)tutil;
-            }
-
-            unsigned int temp = 0;
-            if (!use_tegra_gpu && pNvmlDeviceGetTemperature)
-                pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &temp);
-            if (use_tegra_gpu && tegra_gpu_therm_zone >= 0) {
-                int ttemp = read_tegra_gpu_temp();
-                if (ttemp > 0) temp = (unsigned int)ttemp;
-            }
-
-            unsigned int power_mw = 0;
-            if (pNvmlDeviceGetPowerUsage)
-                pNvmlDeviceGetPowerUsage(dev, &power_mw);
-
-            unsigned int clk = 0;
-            if (pNvmlDeviceGetClockInfo)
-                pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &clk);
-
-            fprintf(f, ",%u,%u,%u,%u", util.gpu, temp, power_mw, clk);
-        } else {
-            fprintf(f, ",,,,");
-        }
-    }
-    if (gpu_count == 0) fprintf(f, ",,,,");
-
-    /* Windowed peaks (30-minute window) */
-    fprintf(f, ",%.1f,%.1f", peak_cpu_pct.peak, peak_cpu_temp_c.peak);
-    for (unsigned int g = 0; g < gpu_count; g++) {
-        fprintf(f, ",%.1f,%.1f", peak_gpu_util[g].peak, peak_gpu_temp_c[g].peak);
-        fprintf(f, ",%.1f", peak_gpu_power_mw[g].peak);
-    }
-
-    for (int i = 0; i < rdma_count; i++)
-        fprintf(f, ",%.0f,%.0f", rdma_ports[i].xmit_bytes_sec, rdma_ports[i].recv_bytes_sec);
-
-    fprintf(f, "\n");
-    fflush(f);
-}
-
 /* ── RDMA / InfiniBand monitoring ───────────────────────────────────── */
 
 static unsigned long long rdma_prev_xmit[MAX_RDMA_PORTS];
@@ -1396,6 +1252,28 @@ static int      prom_buf_size = 0;
 static char    *prom_body = NULL;
 static PromGpu *prom_gpus = NULL;
 
+/* Read all thermal zones. Returns highest valid zone index + 1 (0 = none);
+ * caller skips entries with empty type. temps[] in degrees Celsius. */
+static int read_thermal_zones(double temps[], char types[][64]) {
+    int n = 0;
+    for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/type", i);
+        read_sysfs_str(path, types[i], 64);
+        if (!types[i][0]) continue;
+        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        int millideg = 0;
+        if (fscanf(f, "%d", &millideg) == 1) {
+            temps[i] = millideg / 1000.0;
+            n = i + 1;
+        }
+        fclose(f);
+    }
+    return n;
+}
+
 /* Format all metrics into buf. Returns bytes written. */
 static int format_metrics(char *buf, int buflen) {
     int off = 0;
@@ -1432,8 +1310,7 @@ static int format_metrics(char *buf, int buflen) {
 
     /* CPU usage */
     PM("# HELP nv_cpu_usage_percent CPU utilization\n"
-       "# TYPE nv_cpu_usage_percent gauge\n"
-       "nv_cpu_usage_percent{cpu=\"overall\"} %.1f\n", cpu_pct[0]);
+       "# TYPE nv_cpu_usage_percent gauge\n");
     for (int i = 1; i <= num_cpus; i++) {
         const char *lbl = cpu_part_label(i - 1);
         if (lbl[0])
@@ -1444,16 +1321,25 @@ static int format_metrics(char *buf, int buflen) {
                i - 1, cpu_pct[i]);
     }
 
-    /* CPU temperature */
-    PM("# HELP nv_cpu_temperature_celsius CPU temperature\n"
-       "# TYPE nv_cpu_temperature_celsius gauge\n"
-       "nv_cpu_temperature_celsius %d\n", read_cpu_temp());
+    /* Per-thermal-zone temperatures (zone index + kernel zone type) */
+    {
+        double tz_temp[MAX_THERMAL_ZONES];
+        char tz_type[MAX_THERMAL_ZONES][64];
+        int tz_max = read_thermal_zones(tz_temp, tz_type);
+        if (tz_max > 0) {
+            PM("# HELP nv_thermal_zone_temperature_celsius Thermal zone temperature\n"
+               "# TYPE nv_thermal_zone_temperature_celsius gauge\n");
+            for (int i = 0; i < tz_max; i++)
+                if (tz_type[i][0])
+                    PM("nv_thermal_zone_temperature_celsius{zone=\"%d\",type=\"%s\"} %.1f\n",
+                       i, tz_type[i], tz_temp[i]);
+        }
+    }
 
     /* CPU frequency */
     read_cpu_freqs();
     PM("# HELP nv_cpu_frequency_mhz CPU frequency\n"
-       "# TYPE nv_cpu_frequency_mhz gauge\n"
-       "nv_cpu_frequency_mhz{cpu=\"overall\"} %d\n", cpu_freq_mhz[0]);
+       "# TYPE nv_cpu_frequency_mhz gauge\n");
     for (int i = 1; i <= num_cpus; i++) {
         const char *lbl = cpu_part_label(i - 1);
         if (lbl[0])
@@ -1463,14 +1349,6 @@ static int format_metrics(char *buf, int buflen) {
             PM("nv_cpu_frequency_mhz{cpu=\"%d\"} %d\n",
                i - 1, cpu_freq_mhz[i]);
     }
-
-    /* Windowed peaks (30-minute window) */
-    PM("# HELP nv_cpu_usage_peak_30m_percent Peak CPU utilization over the last 30 minutes\n"
-       "# TYPE nv_cpu_usage_peak_30m_percent gauge\n"
-       "nv_cpu_usage_peak_30m_percent %.1f\n", peak_cpu_pct.peak);
-    PM("# HELP nv_cpu_temperature_peak_30m_celsius Peak CPU temperature over the last 30 minutes\n"
-       "# TYPE nv_cpu_temperature_peak_30m_celsius gauge\n"
-       "nv_cpu_temperature_peak_30m_celsius %.1f\n", peak_cpu_temp_c.peak);
 
     /* Memory */
     MemInfo mi;
@@ -1664,13 +1542,6 @@ static int format_metrics(char *buf, int buflen) {
                           pNvmlDeviceGetEncoderUtilization(dev, &g->enc, &period) == NVML_SUCCESS);
             g->has_dec = (pNvmlDeviceGetDecoderUtilization &&
                           pNvmlDeviceGetDecoderUtilization(dev, &g->dec, &period) == NVML_SUCCESS);
-            /* Update windowed peaks — data is fresh here, called on every scrape */
-            if (peak_gpu_util && d < (unsigned int)gpu_count) {
-                update_windowed_peak(&peak_gpu_util[d], g->util_gpu);
-                update_windowed_peak(&peak_gpu_temp_c[d], g->temp);
-                if (g->has_power)
-                    update_windowed_peak(&peak_gpu_power_mw[d], g->power_mw / 1000.0);
-            }
             n_gpus++;
         }
     }
@@ -1736,22 +1607,6 @@ static int format_metrics(char *buf, int buflen) {
             if (gpus[d].has_dec)
                 PM("nv_gpu_decoder_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].dec);
 
-        /* Windowed peaks (30-minute window) */
-        PM("# HELP nv_gpu_utilization_peak_30m_percent Peak GPU utilization over the last 30 minutes\n"
-           "# TYPE nv_gpu_utilization_peak_30m_percent gauge\n");
-        for (int d = 0; d < n_gpus; d++)
-            PM("nv_gpu_utilization_peak_30m_percent{gpu=\"%d\"} %.1f\n", d, peak_gpu_util[d].peak);
-
-        PM("# HELP nv_gpu_temperature_peak_30m_celsius Peak GPU temperature over the last 30 minutes\n"
-           "# TYPE nv_gpu_temperature_peak_30m_celsius gauge\n");
-        for (int d = 0; d < n_gpus; d++)
-            PM("nv_gpu_temperature_peak_30m_celsius{gpu=\"%d\"} %.1f\n", d, peak_gpu_temp_c[d].peak);
-
-        PM("# HELP nv_gpu_power_peak_30m_watts Peak GPU power draw over the last 30 minutes\n"
-           "# TYPE nv_gpu_power_peak_30m_watts gauge\n");
-        for (int d = 0; d < n_gpus; d++)
-            if (gpus[d].has_power)
-                PM("nv_gpu_power_peak_30m_watts{gpu=\"%d\"} %.1f\n", d, peak_gpu_power_mw[d].peak);
     }
 
     /* RDMA / InfiniBand */
@@ -1869,7 +1724,7 @@ static void *prom_server(void *arg) {
     (void)arg;
     /* Pre-allocate buffers once for the lifetime of the thread */
     prom_buf_size = PROM_BASE_SIZE + (gpu_count * PROM_BYTES_PER_GPU) +
-                    (num_cpus * 80);
+                    (num_cpus * 80) + (MAX_THERMAL_ZONES * 128) + 512;
     prom_body = malloc(prom_buf_size);
     prom_gpus = calloc(gpu_count > 0 ? gpu_count : 1, sizeof(PromGpu));
 
@@ -1953,9 +1808,7 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  -c COLS   CPU display columns (1-4, default: auto)\n"
         "  -g MODE   GPU view mode (auto, compact, detailed)\n"
-        "  -l FILE   Log statistics to CSV file\n"
-        "  -i MS     Log interval in milliseconds (default: 1000)\n"
-        "  -n        No UI (headless mode, requires -l or -p)\n"
+        "  -n        No UI (headless mode, requires -p)\n"
         "  -p PORT   Expose Prometheus metrics on PORT\n"
         "  -t TOKEN  Require Bearer token for /metrics (or NV_MONITOR_TOKEN env)\n"
         "  -r MS     UI refresh interval in milliseconds (default: 1000)\n"
@@ -1963,14 +1816,12 @@ static void print_usage(const char *prog) {
         "  -h        Show this help\n"
         "\n"
         "Examples:\n"
-        "  %s -l stats.csv                  TUI + logging every 1s\n"
-        "  %s -l stats.csv -i 5000          TUI + logging every 5s\n"
-        "  %s -n -l stats.csv -i 500        Headless, log every 500ms\n"
+        "  %s -n -p 9101                    Headless Prometheus exporter on :9101\n"
         "  %s -r 2000                       TUI refreshing every 2s\n"
         "\n"
         "Copyright (c) 2026 Paul Gresham Advisory LLC\n"
         "https://github.com/wentbackward/nv-monitor\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog);
 }
 
 /* ── Main draw ──────────────────────────────────────────────────────── */
@@ -2048,13 +1899,8 @@ static void draw_screen(void) {
     y += 1;
 
     /* ── CPU section ────────────────────────────────────────────────── */
-    int cpu_temp = read_cpu_temp();
     read_cpu_freqs();
     int cpu_freq = cpu_freq_mhz[0];
-
-    /* Update windowed peaks */
-    update_windowed_peak(&peak_cpu_pct, cpu_pct[0]);
-    update_windowed_peak(&peak_cpu_temp_c, cpu_temp);
 
     /* Auto-calculate column count: ~36 chars per column minimum */
     int ncols;
@@ -2123,7 +1969,6 @@ static void draw_screen(void) {
         attroff(A_BOLD | COLOR_PAIR(6));
     }
     if (cpu_freq > 0) printw("  %d MHz", cpu_freq);
-    if (cpu_temp > 0) printw("  %d C", cpu_temp);
 
     if (narrow_header) {
         /* Overall bar on its own line (full width) */
@@ -2365,14 +2210,6 @@ static void draw_screen(void) {
                 pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &gs->clk_gfx);
             gs->has_fan = (pNvmlDeviceGetFanSpeed &&
                            pNvmlDeviceGetFanSpeed(dev, &gs->fan) == NVML_SUCCESS);
-
-            /* Update windowed peaks for this GPU */
-            if (peak_gpu_util) {
-                update_windowed_peak(&peak_gpu_util[d], gs->util_gpu);
-                update_windowed_peak(&peak_gpu_temp_c[d], gs->temp);
-                if (gs->has_power)
-                    update_windowed_peak(&peak_gpu_power_mw[d], gs->power_mw / 1000.0);
-            }
 
             nvmlMemory_t mem = {0};
             gs->has_mem = (pNvmlDeviceGetMemoryInfo &&
@@ -2750,9 +2587,8 @@ int main(int argc, char *argv[]) {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
-    const char *log_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "c:g:l:i:np:t:r:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:g:np:t:r:vh")) != -1) {
         switch (opt) {
         case 'c': cpu_columns = atoi(optarg); if (cpu_columns < 0 || cpu_columns > 4) cpu_columns = 0; break;
         case 'g':
@@ -2760,8 +2596,6 @@ int main(int argc, char *argv[]) {
             else if (strcmp(optarg, "detailed") == 0) gpu_view = 2;
             else gpu_view = 0;
             break;
-        case 'l': log_path = optarg; break;
-        case 'i': log_interval_ms = atoi(optarg); break;
         case 'n': no_ui = 1; break;
         case 'p': prom_port = atoi(optarg); break;
         case 't': prom_token = optarg; break;
@@ -2776,21 +2610,11 @@ int main(int argc, char *argv[]) {
     if (!prom_token)
         prom_token = getenv("NV_MONITOR_TOKEN");
 
-    if (no_ui && !log_path && !prom_port) {
-        fprintf(stderr, "Error: -n (no UI) requires -l <file> or -p <port>\n");
+    if (no_ui && !prom_port) {
+        fprintf(stderr, "Error: -n (no UI) requires -p <port>\n");
         return 1;
     }
-    if (log_interval_ms < 100) log_interval_ms = 100;
     if (delay_ms < 250) delay_ms = 250;
-
-    /* Open log file */
-    if (log_path) {
-        log_fp = fopen(log_path, "w");
-        if (!log_fp) {
-            perror(log_path);
-            return 1;
-        }
-    }
 
     /* Load NVML */
     nvml_ok = (load_nvml() == 0);
@@ -2824,17 +2648,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Allocate windowed peak arrays for GPUs */
-    if (gpu_count > 0) {
-        peak_gpu_util    = calloc(gpu_count, sizeof(WindowedPeak));
-        peak_gpu_temp_c  = calloc(gpu_count, sizeof(WindowedPeak));
-        peak_gpu_power_mw = calloc(gpu_count, sizeof(WindowedPeak));
-        if (!peak_gpu_util || !peak_gpu_temp_c || !peak_gpu_power_mw) {
-            fprintf(stderr, "Failed to allocate GPU peak arrays for %u GPUs\n", gpu_count);
-            return 1;
-        }
-    }
-
     /* Initial CPU tick read */
     read_cpu_ticks(prev_ticks, &num_cpus);
     usleep(100000); /* brief pause for first delta */
@@ -2844,30 +2657,18 @@ int main(int argc, char *argv[]) {
     read_net_totals();
     read_rdma_ports();
 
-    /* Write CSV header after first CPU sample (so we know num_cpus) */
-    if (log_fp)
-        log_csv_header(log_fp);
-
     /* Start Prometheus exporter if requested */
     if (prom_port && prom_start() != 0)
         return 1;
 
     if (no_ui) {
         /* ── Headless mode ──────────────────────────────────────────── */
-        int headless_interval = log_fp ? log_interval_ms : delay_ms;
-        if (log_fp)
-            fprintf(stderr, "Logging to %s every %dms (Ctrl+C to stop)\n",
-                    log_path, headless_interval);
-        else
-            fprintf(stderr, "Running headless (Ctrl+C to stop)\n");
+        fprintf(stderr, "Running headless (Ctrl+C to stop)\n");
         while (!g_quit) {
             compute_cpu_usage();
             read_net_totals();
             read_rdma_ports();
-            update_windowed_peak(&peak_cpu_pct, cpu_pct[0]);
-            update_windowed_peak(&peak_cpu_temp_c, (double)read_cpu_temp());
-            if (log_fp) log_csv_row(log_fp);
-            usleep(headless_interval * 1000);
+            usleep(delay_ms * 1000);
         }
         fprintf(stderr, "\nStopped.\n");
     } else {
@@ -2892,8 +2693,6 @@ int main(int argc, char *argv[]) {
             init_pair(8, 244,           -1); /* dim/gray (256-color) */
         }
 
-        int log_elapsed = 0;
-
         while (!g_quit) {
             compute_cpu_usage();
             read_net_totals();
@@ -2901,15 +2700,6 @@ int main(int argc, char *argv[]) {
             /* Force full repaint to recover from terminal corruption */
             clearok(stdscr, TRUE);
             draw_screen();
-
-            /* Log at log_interval_ms if logging enabled */
-            if (log_fp) {
-                log_elapsed += delay_ms;
-                if (log_elapsed >= log_interval_ms) {
-                    log_csv_row(log_fp);
-                    log_elapsed = 0;
-                }
-            }
 
             /* Input handling - poll within the refresh interval */
             int elapsed = 0;
@@ -2956,7 +2746,6 @@ int main(int argc, char *argv[]) {
     }
 
     prom_stop();
-    if (log_fp) fclose(log_fp);
     if (nvml_ok && pNvmlShutdown) pNvmlShutdown();
     if (nvml_handle) dlclose(nvml_handle);
 
@@ -2966,9 +2755,6 @@ int main(int argc, char *argv[]) {
     free(cpu_pct);    cpu_pct = NULL;
     free(cpu_part);   cpu_part = NULL;
     free(cpu_freq_mhz); cpu_freq_mhz = NULL;
-    free(peak_gpu_util);    peak_gpu_util = NULL;
-    free(peak_gpu_temp_c);  peak_gpu_temp_c = NULL;
-    free(peak_gpu_power_mw); peak_gpu_power_mw = NULL;
 
     return 0;
 }
