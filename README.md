@@ -71,9 +71,9 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_build_info` | gauge | `version` | nv-monitor version |
 | `nv_uptime_seconds` | gauge | | System uptime |
 | `nv_load_average` | gauge | `interval` | Load average (1m, 5m, 15m) |
-| `nv_cpu_usage_percent` | gauge | `cpu`, `type` | Per-core CPU utilization (type = ARM core: X925, X725, etc.) |
+| `nv_cpu_usage_percent` | gauge | `cpu`, `type` | Per-core CPU utilization (type = ARM core: X925, X725, etc.; `unknown` on x86) |
 | `nv_thermal_zone_temperature_celsius` | gauge | `zone`, `type` | Per-thermal-zone temperature (e.g. cpu-therm, GPU-therm) |
-| `nv_cpu_frequency_mhz` | gauge | | CPU frequency |
+| `nv_cpu_frequency_mhz` | gauge | `cpu`, `type` | Per-core CPU frequency (type = ARM core, `unknown` on x86) |
 | `nv_memory_total_bytes` | gauge | | Total system memory |
 | `nv_memory_used_bytes` | gauge | | Application memory used |
 | `nv_memory_bufcache_bytes` | gauge | | Buffer and cache memory |

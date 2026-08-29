@@ -192,7 +192,7 @@ static const char *cpu_part_label(int cpu_idx) {
     case 0xd0a: return "A75";
     case 0xd07: return "A57";   /* Jetson TX1/TX2 */
     case 0xd03: return "A53";   /* Jetson Nano (original) */
-    default:    return "";
+    default:    return "unknown"; /* x86 or unmapped part — keep label sets consistent */
     }
 }
 
@@ -713,15 +713,9 @@ static int format_metrics(char *buf, int buflen) {
     compute_cpu_usage();
     PM("# HELP nv_cpu_usage_percent CPU utilization\n"
        "# TYPE nv_cpu_usage_percent gauge\n");
-    for (int i = 1; i <= num_cpus; i++) {
-        const char *lbl = cpu_part_label(i - 1);
-        if (lbl[0])
-            PM("nv_cpu_usage_percent{cpu=\"%d\",type=\"%s\"} %.1f\n",
-               i - 1, lbl, cpu_pct[i]);
-        else
-            PM("nv_cpu_usage_percent{cpu=\"%d\"} %.1f\n",
-               i - 1, cpu_pct[i]);
-    }
+    for (int i = 1; i <= num_cpus; i++)
+        PM("nv_cpu_usage_percent{cpu=\"%d\",type=\"%s\"} %.1f\n",
+           i - 1, cpu_part_label(i - 1), cpu_pct[i]);
 
     /* Per-thermal-zone temperatures (zone index + kernel zone type) */
     {
@@ -742,15 +736,9 @@ static int format_metrics(char *buf, int buflen) {
     read_cpu_freqs();
     PM("# HELP nv_cpu_frequency_mhz CPU frequency\n"
        "# TYPE nv_cpu_frequency_mhz gauge\n");
-    for (int i = 1; i <= num_cpus; i++) {
-        const char *lbl = cpu_part_label(i - 1);
-        if (lbl[0])
-            PM("nv_cpu_frequency_mhz{cpu=\"%d\",type=\"%s\"} %d\n",
-               i - 1, lbl, cpu_freq_mhz[i]);
-        else
-            PM("nv_cpu_frequency_mhz{cpu=\"%d\"} %d\n",
-               i - 1, cpu_freq_mhz[i]);
-    }
+    for (int i = 1; i <= num_cpus; i++)
+        PM("nv_cpu_frequency_mhz{cpu=\"%d\",type=\"%s\"} %d\n",
+           i - 1, cpu_part_label(i - 1), cpu_freq_mhz[i]);
 
     /* Memory */
     MemInfo mi;

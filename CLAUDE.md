@@ -19,7 +19,7 @@ Direct compilation: `gcc -O2 -Wall -Wextra -std=gnu11 -o nv-monitor nv-monitor.c
 
 Dependencies: `build-essential`
 
-Works on both **aarch64** (DGX Spark) and **x86_64**. On x86, ARM core type labels are omitted; everything else works identically.
+Works on both **aarch64** (DGX Spark) and **x86_64**. On x86 the per-core `type` label is `unknown` (no ARM part IDs); everything else works identically.
 
 ## Architecture
 
