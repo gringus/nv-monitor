@@ -19,10 +19,8 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <signal.h>
-#include <time.h>
 #include <locale.h>
 #include <sys/sysinfo.h>
-#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <mntent.h>
 #include <getopt.h>
@@ -72,12 +70,13 @@ static nvmlReturn_t (*pNvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned i
 static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
 static unsigned int gpu_count = 0;      /* number of GPUs detected */
-static int   use_tegra_gpu = 0;         /* prefer Tegra sysfs over NVML for GPU metrics */
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
 #define MAX_THERMAL_ZONES 20
-#define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c overrides this */
+#ifndef THERMAL_BASE
+#define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c redefines this before including nv-monitor.c */
+#endif
 
 /* ── CPU state (dynamically allocated at startup) ──────────────────── */
 
@@ -194,6 +193,35 @@ static const char *cpu_part_label(int cpu_idx) {
     case 0xd03: return "A53";   /* Jetson Nano (original) */
     default:    return "unknown"; /* x86 or unmapped part — keep label sets consistent */
     }
+}
+
+/* ── sysfs / proc read helpers ──────────────────────────────────────── */
+
+static unsigned long long read_sysfs_ull(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long val = 0;
+    (void)!fscanf(f, "%llu", &val);
+    fclose(f);
+    return val;
+}
+
+static void read_sysfs_str(const char *path, char *buf, int len) {
+    FILE *f = fopen(path, "r");
+    if (!f) { buf[0] = '\0'; return; }
+    if (!fgets(buf, len, f)) buf[0] = '\0';
+    fclose(f);
+    buf[strcspn(buf, "\n\r")] = '\0';
+}
+
+/* Read a decimal int; returns 1 on success, 0 otherwise. */
+static int read_sysfs_int(const char *path, int *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int val = 0, ok = (fscanf(f, "%d", &val) == 1);
+    fclose(f);
+    if (ok) *out = val;
+    return ok;
 }
 
 /* ── CPU sampling ───────────────────────────────────────────────────── */
@@ -321,25 +349,12 @@ static void read_meminfo(MemInfo *m) {
 /* ── CPU frequency ──────────────────────────────────────────────────── */
 
 static void read_cpu_freqs(void) {
-    /* Aggregate frequency (cpu0) for backward compatibility */
-    FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
-    if (f) {
-        int khz = 0;
-        (void)!fscanf(f, "%d", &khz);
-        fclose(f);
-        cpu_freq_mhz[0] = khz / 1000;
-    }
-    /* Per-core frequencies */
     for (int i = 1; i <= num_cpus; i++) {
         char path[64];
+        int khz;
         snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", i - 1);
-        f = fopen(path, "r");
-        if (f) {
-            int khz = 0;
-            (void)!fscanf(f, "%d", &khz);
-            fclose(f);
+        if (read_sysfs_int(path, &khz))
             cpu_freq_mhz[i] = khz / 1000;
-        }
     }
 }
 
@@ -348,6 +363,8 @@ static void read_cpu_freqs(void) {
 static int tegra_gpu_available = 0;
 static char tegra_gpu_load_path[256] = "";
 static int tegra_gpu_therm_zone = -1; /* thermal zone index for GPU-therm */
+
+static int read_thermal_zones(double temps[], char types[][64]);
 
 static void detect_tegra_gpu(void) {
     /* Try known Tegra GPU load paths */
@@ -367,44 +384,24 @@ static void detect_tegra_gpu(void) {
         }
     }
 
-    /* Find GPU thermal zone */
-    for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
-        char path[128], type[64] = "";
-        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", i);
-        FILE *f = fopen(path, "r");
-        if (!f) break;
-        if (fgets(type, sizeof(type), f)) {
-            type[strcspn(type, "\n\r")] = '\0';
-            if (strcasecmp(type, "GPU-therm") == 0 ||
-                strcasecmp(type, "gpu-thermal") == 0) {
+    /* Find GPU thermal zone (reuses the generic zone reader, which skips gaps) */
+    {
+        double temps[MAX_THERMAL_ZONES];
+        char types[MAX_THERMAL_ZONES][64];
+        int max = read_thermal_zones(temps, types);
+        for (int i = 0; i < max; i++)
+            if (strcasecmp(types[i], "GPU-therm") == 0 ||
+                strcasecmp(types[i], "gpu-thermal") == 0) {
                 tegra_gpu_therm_zone = i;
-                fclose(f);
                 break;
             }
-        }
-        fclose(f);
     }
 }
 
 static int read_tegra_gpu_util(void) {
-    FILE *f = fopen(tegra_gpu_load_path, "r");
-    if (!f) return -1;
-    int load = 0;
-    (void)!fscanf(f, "%d", &load);
-    fclose(f);
+    int load;
+    if (!read_sysfs_int(tegra_gpu_load_path, &load)) return -1;
     return load / 10; /* scale is 0-1000 -> 0-100% */
-}
-
-static int read_tegra_gpu_temp(void) {
-    if (tegra_gpu_therm_zone < 0) return -1;
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", tegra_gpu_therm_zone);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    int t = 0;
-    (void)!fscanf(f, "%d", &t);
-    fclose(f);
-    return t / 1000;
 }
 
 /* ── NIC ASIC temperature (ConnectX / mlx5) ─────────────────────────── */
@@ -449,12 +446,9 @@ static void detect_nic_asic_sensors(void) {
 static int read_nic_asic_temp(void) {
     int max_temp = 0;
     for (int i = 0; i < nic_sensor_count; i++) {
-        FILE *f = fopen(nic_sensor_paths[i], "r");
-        if (!f) continue;
-        int millideg = 0;
-        if (fscanf(f, "%d", &millideg) == 1 && millideg / 1000 > max_temp)
+        int millideg;
+        if (read_sysfs_int(nic_sensor_paths[i], &millideg) && millideg / 1000 > max_temp)
             max_temp = millideg / 1000;
-        fclose(f);
     }
     return max_temp;
 }
@@ -469,20 +463,9 @@ static void get_loadavg(double *l1, double *l5, double *l15) {
 
 /* ── Network counters (emitted as Prometheus *_total) ───────────────── */
 
-typedef struct {
-    unsigned long long rx_bytes;
-    unsigned long long tx_bytes;
-    int valid;
-} NetTotals;
-
-static NetTotals net_totals = {0};
-
-static void read_net_totals(void) {
+static int read_net_totals(unsigned long long *rx_bytes, unsigned long long *tx_bytes) {
     FILE *f = fopen("/proc/net/dev", "r");
-    if (!f) {
-        net_totals.valid = 0;
-        return;
-    }
+    if (!f) return 0;
 
     unsigned long long rx_total = 0;
     unsigned long long tx_total = 0;
@@ -516,9 +499,9 @@ static void read_net_totals(void) {
     }
     fclose(f);
 
-    net_totals.rx_bytes = rx_total;
-    net_totals.tx_bytes = tx_total;
-    net_totals.valid = 1;
+    *rx_bytes = rx_total;
+    *tx_bytes = tx_total;
+    return 1;
 }
 
 /* ── RDMA types (used by Prometheus) ───────────────── */
@@ -539,32 +522,13 @@ typedef struct {
 
 static RdmaPort rdma_ports[MAX_RDMA_PORTS];
 static int       rdma_count = 0;
-static int       rdma_available = 0;
 
 /* ── RDMA / InfiniBand monitoring ───────────────────────────────────── */
 
-static unsigned long long read_sysfs_ull(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    unsigned long long val = 0;
-    (void)!fscanf(f, "%llu", &val);
-    fclose(f);
-    return val;
-}
-
-static void read_sysfs_str(const char *path, char *buf, int len) {
-    FILE *f = fopen(path, "r");
-    if (!f) { buf[0] = '\0'; return; }
-    if (!fgets(buf, len, f)) buf[0] = '\0';
-    fclose(f);
-    buf[strcspn(buf, "\n\r")] = '\0';
-}
-
 static void read_rdma_ports(void) {
     DIR *ib_dir = opendir("/sys/class/infiniband");
-    if (!ib_dir) { rdma_available = 0; rdma_count = 0; return; }
+    if (!ib_dir) { rdma_count = 0; return; }
 
-    rdma_available = 1;
     int idx = 0;
     struct dirent *dev_ent;
     while ((dev_ent = readdir(ib_dir)) && idx < MAX_RDMA_PORTS) {
@@ -574,15 +538,13 @@ static void read_rdma_ports(void) {
         for (int p = 1; p <= 2 && idx < MAX_RDMA_PORTS; p++) {
             char path[256];
             snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/state", dev_ent->d_name, p);
-            FILE *test = fopen(path, "r");
-            if (!test) continue;
-            fclose(test);
 
             RdmaPort *r = &rdma_ports[idx];
             snprintf(r->device, sizeof(r->device), "%s", dev_ent->d_name);
             r->port = p;
 
             read_sysfs_str(path, r->state, sizeof(r->state));
+            if (!r->state[0]) continue; /* no such port */
             /* Strip numeric prefix like "4: ACTIVE" -> "ACTIVE" */
             char *colon = strchr(r->state, ':');
             if (colon) {
@@ -634,7 +596,6 @@ static pthread_t prom_thread;
 #define PROM_BASE_SIZE 8192     /* base buffer for CPU/memory/system metrics */
 
 typedef struct {
-    int      valid;
     char     name[96];
     unsigned int util_gpu;
     unsigned int temp;
@@ -662,15 +623,12 @@ static int read_thermal_zones(double temps[], char types[][64]) {
         snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/type", i);
         read_sysfs_str(path, types[i], 64);
         if (!types[i][0]) continue;
+        int millideg;
         snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
-        int millideg = 0;
-        if (fscanf(f, "%d", &millideg) == 1) {
+        if (read_sysfs_int(path, &millideg)) {
             temps[i] = millideg / 1000.0;
             n = i + 1;
         }
-        fclose(f);
     }
     return n;
 }
@@ -718,18 +676,16 @@ static int format_metrics(char *buf, int buflen) {
            i - 1, cpu_part_label(i - 1), cpu_pct[i]);
 
     /* Per-thermal-zone temperatures (zone index + kernel zone type) */
-    {
-        double tz_temp[MAX_THERMAL_ZONES];
-        char tz_type[MAX_THERMAL_ZONES][64];
-        int tz_max = read_thermal_zones(tz_temp, tz_type);
-        if (tz_max > 0) {
-            PM("# HELP nv_thermal_zone_temperature_celsius Thermal zone temperature\n"
-               "# TYPE nv_thermal_zone_temperature_celsius gauge\n");
-            for (int i = 0; i < tz_max; i++)
-                if (tz_type[i][0])
-                    PM("nv_thermal_zone_temperature_celsius{zone=\"%d\",type=\"%s\"} %.1f\n",
-                       i, tz_type[i], tz_temp[i]);
-        }
+    double tz_temp[MAX_THERMAL_ZONES] = {0};
+    char tz_type[MAX_THERMAL_ZONES][64];
+    int tz_max = read_thermal_zones(tz_temp, tz_type);
+    if (tz_max > 0) {
+        PM("# HELP nv_thermal_zone_temperature_celsius Thermal zone temperature\n"
+           "# TYPE nv_thermal_zone_temperature_celsius gauge\n");
+        for (int i = 0; i < tz_max; i++)
+            if (tz_type[i][0])
+                PM("nv_thermal_zone_temperature_celsius{zone=\"%d\",type=\"%s\"} %.1f\n",
+                   i, tz_type[i], tz_temp[i]);
     }
 
     /* CPU frequency */
@@ -764,15 +720,15 @@ static int format_metrics(char *buf, int buflen) {
            mi.swap_total_kb * 1024ULL, mi.swap_used_kb * 1024ULL);
     }
 
-    read_net_totals();
-    if (net_totals.valid) {
+    unsigned long long rx_bytes = 0, tx_bytes = 0;
+    if (read_net_totals(&rx_bytes, &tx_bytes)) {
         PM("# HELP nv_network_receive_bytes_total Total bytes received across all non-loopback interfaces\n"
            "# TYPE nv_network_receive_bytes_total counter\n"
            "nv_network_receive_bytes_total %llu\n"
            "# HELP nv_network_transmit_bytes_total Total bytes transmitted across all non-loopback interfaces\n"
            "# TYPE nv_network_transmit_bytes_total counter\n"
            "nv_network_transmit_bytes_total %llu\n",
-           net_totals.rx_bytes, net_totals.tx_bytes);
+           rx_bytes, tx_bytes);
     }
 
     int nic_temp = read_nic_asic_temp();
@@ -873,37 +829,33 @@ static int format_metrics(char *buf, int buflen) {
     /* GPU — collect data first, then format grouped by metric family */
     PromGpu *gpus = prom_gpus;
     int n_gpus = 0;
-    if (gpus && gpu_count > 0)
-        memset(gpus, 0, gpu_count * sizeof(PromGpu));
 
     if (nvml_ok) {
         unsigned int dev_count = 0;
         pNvmlDeviceGetCount(&dev_count);
 
         for (unsigned int d = 0; gpus && d < dev_count && d < gpu_count; d++) {
-            if ((unsigned int)n_gpus >= gpu_count) break;
             PromGpu *g = &gpus[n_gpus];
             memset(g, 0, sizeof(*g));
             nvmlDevice_t dev;
             if (pNvmlDeviceGetHandleByIndex(d, &dev) != NVML_SUCCESS) continue;
-            g->valid = 1;
             pNvmlDeviceGetName(dev, g->name, sizeof(g->name));
 
             nvmlUtilization_t util = {0};
-            if (!use_tegra_gpu && pNvmlDeviceGetUtilizationRates)
+            if (!tegra_gpu_available && pNvmlDeviceGetUtilizationRates)
                 pNvmlDeviceGetUtilizationRates(dev, &util);
-            if (use_tegra_gpu) {
+            if (tegra_gpu_available) {
                 int tutil = read_tegra_gpu_util();
                 if (tutil >= 0) util.gpu = (unsigned int)tutil;
             }
             g->util_gpu = util.gpu;
 
-            if (!use_tegra_gpu && pNvmlDeviceGetTemperature)
+            if (!tegra_gpu_available && pNvmlDeviceGetTemperature)
                 pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &g->temp);
-            if (use_tegra_gpu && tegra_gpu_therm_zone >= 0) {
-                int ttemp = read_tegra_gpu_temp();
-                if (ttemp > 0) g->temp = (unsigned int)ttemp;
-            }
+            if (tegra_gpu_available &&
+                tegra_gpu_therm_zone >= 0 && tegra_gpu_therm_zone < tz_max &&
+                tz_temp[tegra_gpu_therm_zone] > 0)
+                g->temp = (unsigned int)tz_temp[tegra_gpu_therm_zone];
 
             g->has_power = (pNvmlDeviceGetPowerUsage &&
                             pNvmlDeviceGetPowerUsage(dev, &g->power_mw) == NVML_SUCCESS);
@@ -995,7 +947,7 @@ static int format_metrics(char *buf, int buflen) {
 
     /* RDMA / InfiniBand */
     read_rdma_ports();
-    if (rdma_available && rdma_count > 0) {
+    if (rdma_count > 0) {
         PM("# HELP nv_rdma_info RDMA port information\n"
            "# TYPE nv_rdma_info gauge\n");
         for (int i = 0; i < rdma_count; i++)
@@ -1224,12 +1176,10 @@ int main(int argc, char *argv[]) {
     if (nvml_ok && pNvmlDeviceGetCount)
         pNvmlDeviceGetCount(&gpu_count);
 
-    /* Detect Tegra GPU sysfs (Jetson fallback) */
+    /* Detect Tegra GPU sysfs (Jetson fallback); when detected, the scrape
+     * path prefers Tegra sysfs over NVML, which returns zeros there */
     detect_tegra_gpu();
     detect_nic_asic_sensors();
-    /* On Tegra/Jetson, NVML returns SUCCESS but zeros for util/temp — prefer sysfs */
-    if (tegra_gpu_available)
-        use_tegra_gpu = 1;
 
     /* Detect CPU count and allocate arrays */
     max_cpus = (int)sysconf(_SC_NPROCESSORS_CONF);

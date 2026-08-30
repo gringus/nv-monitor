@@ -2,46 +2,17 @@
  * Tests for read_thermal_zones() — the per-zone parser used by the
  * Prometheus exporter.
  *
- * Build & run: gcc -O0 -Wall -Wextra -o test_thermal test_thermal.c && ./test_thermal
+ * Build & run: make test
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <sys/stat.h>
+#include <sys/stat.h> /* mkdir for fixtures */
 
-/* Pull in the functions under test (verbatim copies from nv-monitor.c).
- * Only THERMAL_BASE differs — it points at a fixture dir, not /sys. */
-#define MAX_THERMAL_ZONES 20
-#define THERMAL_BASE      "/tmp/nvmon-tz-test"
-
-static void read_sysfs_str(const char *path, char *buf, int len) {
-    FILE *f = fopen(path, "r");
-    if (!f) { buf[0] = '\0'; return; }
-    if (!fgets(buf, len, f)) buf[0] = '\0';
-    fclose(f);
-    buf[strcspn(buf, "\n\r")] = '\0';
-}
-
-static int read_thermal_zones(double temps[], char types[][64]) {
-    int n = 0;
-    for (int i = 0; i < MAX_THERMAL_ZONES; i++) {
-        char path[128];
-        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/type", i);
-        read_sysfs_str(path, types[i], 64);
-        if (!types[i][0]) continue;
-        snprintf(path, sizeof(path), THERMAL_BASE "/thermal_zone%d/temp", i);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
-        int millideg = 0;
-        if (fscanf(f, "%d", &millideg) == 1) {
-            temps[i] = millideg / 1000.0;
-            n = i + 1;
-        }
-        fclose(f);
-    }
-    return n;
-}
+/* Test the real code from nv-monitor.c, pointing THERMAL_BASE at a
+ * fixture dir instead of /sys. */
+#define THERMAL_BASE  "/tmp/nvmon-tz-test"
+#define main          nv_monitor_main
+#include "nv-monitor.c"
+#undef main
 
 static int tests_run = 0;
 static int tests_passed = 0;

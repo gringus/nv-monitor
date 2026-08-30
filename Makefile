@@ -20,7 +20,9 @@ portable:
 test: test_meminfo.c test_thermal.c
 	$(CC) -O0 -Wall -Wextra -o test_meminfo test_meminfo.c
 	./test_meminfo
-	$(CC) -O0 -Wall -Wextra -o test_thermal test_thermal.c
+	# -Wno-format-truncation: pre-existing snprintfs in nv-monitor.c trip the
+	# -O0-only analyzer; the release build (-O3 -flto) is warning-clean
+	$(CC) -O0 -Wall -Wextra -Wno-format-truncation -o test_thermal test_thermal.c $(LDFLAGS)
 	./test_thermal
 
 lint:
