@@ -463,12 +463,20 @@ static void get_loadavg(double *l1, double *l5, double *l15) {
 
 /* ── Network counters (emitted as Prometheus *_total) ───────────────── */
 
-static int read_net_totals(unsigned long long *rx_bytes, unsigned long long *tx_bytes) {
+#define MAX_NET_DEVS 32
+
+typedef struct {
+    char name[64];
+    unsigned long long rx_bytes;
+    unsigned long long tx_bytes;
+} NetDev;
+
+/* Read per-interface counters (skips loopback). Returns count filled. */
+static int read_net_devices(NetDev *devs, int max) {
     FILE *f = fopen("/proc/net/dev", "r");
     if (!f) return 0;
 
-    unsigned long long rx_total = 0;
-    unsigned long long tx_total = 0;
+    int n = 0;
     char line[512];
     int line_no = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -479,11 +487,12 @@ static int read_net_totals(unsigned long long *rx_bytes, unsigned long long *tx_
         if (!colon) continue;
         *colon = '\0';
 
-        char ifname[64];
-        snprintf(ifname, sizeof(ifname), "%s", line);
-        char *name = ifname;
-        while (*name == ' ') name++;
-        if (strcmp(name, "lo") == 0) continue;
+        char name[64];
+        snprintf(name, sizeof(name), "%s", line);
+        char *p = name;
+        while (*p == ' ') p++;
+        if (strcmp(p, "lo") == 0) continue;
+        if (n >= max) continue;
 
         unsigned long long rx_bytes = 0, tx_bytes = 0;
         unsigned long long discard[14];
@@ -493,15 +502,15 @@ static int read_net_totals(unsigned long long *rx_bytes, unsigned long long *tx_
                    &discard[0], &discard[1], &discard[2], &discard[3], &discard[4], &discard[5], &discard[6],
                    &tx_bytes,
                    &discard[7], &discard[8], &discard[9], &discard[10], &discard[11], &discard[12], &discard[13]) == 16) {
-            rx_total += rx_bytes;
-            tx_total += tx_bytes;
+            snprintf(devs[n].name, sizeof(devs[n].name), "%s", p);
+            devs[n].rx_bytes = rx_bytes;
+            devs[n].tx_bytes = tx_bytes;
+            n++;
         }
     }
     fclose(f);
 
-    *rx_bytes = rx_total;
-    *tx_bytes = tx_total;
-    return 1;
+    return n;
 }
 
 /* ── RDMA types (used by Prometheus) ───────────────── */
@@ -720,15 +729,19 @@ static int format_metrics(char *buf, int buflen) {
            mi.swap_total_kb * 1024ULL, mi.swap_used_kb * 1024ULL);
     }
 
-    unsigned long long rx_bytes = 0, tx_bytes = 0;
-    if (read_net_totals(&rx_bytes, &tx_bytes)) {
-        PM("# HELP nv_network_receive_bytes_total Total bytes received across all non-loopback interfaces\n"
-           "# TYPE nv_network_receive_bytes_total counter\n"
-           "nv_network_receive_bytes_total %llu\n"
-           "# HELP nv_network_transmit_bytes_total Total bytes transmitted across all non-loopback interfaces\n"
-           "# TYPE nv_network_transmit_bytes_total counter\n"
-           "nv_network_transmit_bytes_total %llu\n",
-           rx_bytes, tx_bytes);
+    NetDev net_devs[MAX_NET_DEVS];
+    int n_net = read_net_devices(net_devs, MAX_NET_DEVS);
+    if (n_net > 0) {
+        PM("# HELP nv_network_receive_bytes_total Total bytes received per network interface\n"
+           "# TYPE nv_network_receive_bytes_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_receive_bytes_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].rx_bytes);
+        PM("# HELP nv_network_transmit_bytes_total Total bytes transmitted per network interface\n"
+           "# TYPE nv_network_transmit_bytes_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_transmit_bytes_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].tx_bytes);
     }
 
     int nic_temp = read_nic_asic_temp();
@@ -1049,7 +1062,8 @@ static void *prom_server(void *arg) {
     (void)arg;
     /* Pre-allocate buffers once for the lifetime of the thread */
     prom_buf_size = PROM_BASE_SIZE + (gpu_count * PROM_BYTES_PER_GPU) +
-                    (num_cpus * 80) + (MAX_THERMAL_ZONES * 128) + 512;
+                    (num_cpus * 80) + (MAX_THERMAL_ZONES * 128) +
+                    (MAX_NET_DEVS * 128) + 512;
     prom_body = malloc(prom_buf_size);
     prom_gpus = calloc(gpu_count > 0 ? gpu_count : 1, sizeof(PromGpu));
 
