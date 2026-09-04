@@ -8,9 +8,10 @@
 #include <sys/stat.h> /* mkdir for fixtures */
 
 /* Test the real code from nv-monitor.c, pointing THERMAL_BASE at a
- * fixture dir instead of /sys. */
-#define THERMAL_BASE  "/tmp/nvmon-tz-test"
-#define main          nv_monitor_main
+ * fixture dir instead of /sys, and DISKSTATS_PATH at a fixture file. */
+#define THERMAL_BASE    "/tmp/nvmon-tz-test"
+#define DISKSTATS_PATH  "/tmp/nvmon-diskstats-test"
+#define main            nv_monitor_main
 #include "nv-monitor.c"
 #undef main
 
@@ -115,10 +116,64 @@ static void test_incomplete_zones(void) {
     ASSERT_EQ_INT("incomplete: type[1] empty", types[1][0], 0);
 }
 
+/* ── read_diskstats: whole-disk filter + field extraction ───────────── */
+
+static void test_is_whole_disk(void) {
+    ASSERT_EQ_INT("sda",      is_whole_disk("sda"),      1);
+    ASSERT_EQ_INT("sda1",     is_whole_disk("sda1"),     0);
+    ASSERT_EQ_INT("vdb",      is_whole_disk("vdb"),      1);
+    ASSERT_EQ_INT("xvda",     is_whole_disk("xvda"),     1);
+    ASSERT_EQ_INT("xvda1",    is_whole_disk("xvda1"),    0);
+    ASSERT_EQ_INT("nvme0n1",  is_whole_disk("nvme0n1"),  1);
+    ASSERT_EQ_INT("nvme0n1p1",is_whole_disk("nvme0n1p1"),0);
+    ASSERT_EQ_INT("mmcblk0",  is_whole_disk("mmcblk0"),  1);
+    ASSERT_EQ_INT("mmcblk0p1",is_whole_disk("mmcblk0p1"),0);
+    ASSERT_EQ_INT("dm-0",     is_whole_disk("dm-0"),     0);
+    ASSERT_EQ_INT("loop0",    is_whole_disk("loop0"),    0);
+    ASSERT_EQ_INT("sr0",      is_whole_disk("sr0"),      0);
+    ASSERT_EQ_INT("zram0",    is_whole_disk("zram0"),    0);
+    ASSERT_EQ_INT("md0",      is_whole_disk("md0"),      0);
+}
+
+static void test_diskstats(void) {
+    FILE *f = fopen(DISKSTATS_PATH, "w");
+    if (!f) { ASSERT_EQ_INT("fixture writable", 0, 1); return; }
+    fputs(
+        "   8       0 sda 100 1 2000 50 300 2 4000 60 0 0 0 0 0 0 0 0 0\n"
+        "   8       1 sda1 50 0 1000 20 100 0 2000 20 0 0 0 0 0 0 0 0 0\n"
+        " 259       0 nvme0n1 1000 10 40000 100 2000 20 80000 200 0 0 0 0 0 0 0 0 0 0\n"
+        " 259       1 nvme0n1p1 500 5 20000 50 1000 10 40000 100 0 0 0 0 0 0 0 0 0 0\n"
+        " 253       0 dm-0 10 0 100 1 10 0 100 1 0 0 0 0 0 0 0 0 0 0\n"
+        "   7       0 loop0 1 0 2 0 3 0 4 0 0 0 0 0 0 0 0 0 0\n"
+        " 179       0 mmcblk0 7 0 100 1 2 0 50 1 0 0 0 0 0 0 0 0 0 0\n"
+        " 254       0 zram0 1 0 10 0 1 0 10 0 0 0 0 0 0 0 0 0 0\n"
+        "  11       0 sr0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", f);
+    fclose(f);
+
+    DiskIO devs[MAX_DISK_DEVS];
+    int n = read_diskstats(devs, MAX_DISK_DEVS);
+    ASSERT_EQ_INT("3 whole disks", n, 3);
+    if (n == 3) {
+        ASSERT_STR("name[0]", devs[0].name, "sda");
+        ASSERT_STR("name[1]", devs[1].name, "nvme0n1");
+        ASSERT_STR("name[2]", devs[2].name, "mmcblk0");
+        ASSERT_EQ_INT("sda reads",    devs[0].reads,    100);
+        ASSERT_EQ_INT("sda rsectors", devs[0].rsectors, 2000);
+        ASSERT_EQ_INT("sda writes",   devs[0].writes,   300);
+        ASSERT_EQ_INT("sda wsectors", devs[0].wsectors, 4000);
+        ASSERT_EQ_INT("nvme reads",     devs[1].reads,     1000);
+        ASSERT_EQ_INT("nvme wsectors",  devs[1].wsectors,  80000);
+        ASSERT_EQ_INT("mmcblk0 reads",  devs[2].reads,     7);
+    }
+    (void)!system("rm -f " DISKSTATS_PATH);
+}
+
 int main(void) {
     test_zones_with_gap();
     test_no_zones();
     test_incomplete_zones();
+    test_is_whole_disk();
+    test_diskstats();
 
     (void)!system("rm -rf " THERMAL_BASE);
     printf("%d/%d tests passed\n", tests_passed, tests_run);

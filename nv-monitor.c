@@ -46,11 +46,9 @@ typedef struct {
 } nvmlMemory_t;
 
 #define NVML_SUCCESS 0
-#define NVML_ERROR_NOT_SUPPORTED 3
 #define NVML_TEMPERATURE_GPU 0
 #define NVML_CLOCK_GRAPHICS 0
 #define NVML_CLOCK_MEM 2
-#define NVML_CLOCK_SM 1
 
 /* NVML function pointers */
 static nvmlReturn_t (*pNvmlInit)(void);
@@ -66,6 +64,12 @@ static nvmlReturn_t (*pNvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int *
 static nvmlReturn_t (*pNvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
+static nvmlReturn_t (*pNvmlDeviceGetPerformanceState)(nvmlDevice_t, int *);
+static nvmlReturn_t (*pNvmlDeviceGetCurrClocksThrottleReasons)(nvmlDevice_t, unsigned long long *);
+static nvmlReturn_t (*pNvmlDeviceGetTotalEnergyConsumption)(nvmlDevice_t, unsigned long long *);
+static nvmlReturn_t (*pNvmlDeviceGetPcieReplayCounter)(nvmlDevice_t, unsigned int *);
+static nvmlReturn_t (*pNvmlDeviceGetUUID)(nvmlDevice_t, char *, unsigned int);
+static nvmlReturn_t (*pNvmlSystemGetDriverVersion)(char *, unsigned int);
 
 static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
@@ -99,6 +103,7 @@ static volatile sig_atomic_t g_quit = 0;
 /* Command-line options */
 static int   prom_port = 0;  /* Prometheus metrics port (0 = not set) */
 static const char *prom_token = NULL; /* Bearer token for /metrics auth */
+static char  prom_expected_hdr[512] = ""; /* "Authorization: Bearer <token>", built at startup */
 
 /* ── Signal handler ─────────────────────────────────────────────────── */
 
@@ -146,6 +151,14 @@ static int load_nvml(void) {
     LOAD(pNvmlDeviceGetFanSpeed,                  "nvmlDeviceGetFanSpeed");
     LOAD(pNvmlDeviceGetEncoderUtilization,        "nvmlDeviceGetEncoderUtilization");
     LOAD(pNvmlDeviceGetDecoderUtilization,        "nvmlDeviceGetDecoderUtilization");
+    LOAD(pNvmlDeviceGetPerformanceState,          "nvmlDeviceGetPerformanceState");
+    /* GB10's NVML dropped the *Curr* symbols; *Current* is the modern name */
+    LOAD(pNvmlDeviceGetCurrClocksThrottleReasons, "nvmlDeviceGetCurrentClocksThrottleReasons",
+        "nvmlDeviceGetCurrClocksThrottleReasons_v2", "nvmlDeviceGetCurrClocksThrottleReasons");
+    LOAD(pNvmlDeviceGetTotalEnergyConsumption,    "nvmlDeviceGetTotalEnergyConsumption");
+    LOAD(pNvmlDeviceGetPcieReplayCounter,         "nvmlDeviceGetPcieReplayCounter");
+    LOAD(pNvmlDeviceGetUUID,                      "nvmlDeviceGetUUID_v2", "nvmlDeviceGetUUID");
+    LOAD(pNvmlSystemGetDriverVersion,             "nvmlSystemGetDriverVersion_v2", "nvmlSystemGetDriverVersion");
     #undef LOAD
 
     if (!pNvmlInit) return -1;
@@ -226,6 +239,8 @@ static int read_sysfs_int(const char *path, int *out) {
 
 /* ── CPU sampling ───────────────────────────────────────────────────── */
 
+#define CPU_TICK_FMT "%llu %llu %llu %llu %llu %llu %llu %llu"
+
 static void read_cpu_ticks(CpuTick ticks[], int *n_cpus) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) return;
@@ -237,17 +252,16 @@ static void read_cpu_ticks(CpuTick ticks[], int *n_cpus) {
         CpuTick t = {0};
         if (line[3] == ' ') {
             /* aggregate */
-            sscanf(line + 4, "%llu %llu %llu %llu %llu %llu %llu %llu",
+            sscanf(line + 4, CPU_TICK_FMT,
                    &t.user, &t.nice, &t.system, &t.idle,
                    &t.iowait, &t.irq, &t.softirq, &t.steal);
             ticks[0] = t;
         } else {
             int cpunum;
-            sscanf(line + 3, "%d", &cpunum);
-            sscanf(strchr(line + 3, ' ') + 1, "%llu %llu %llu %llu %llu %llu %llu %llu",
-                   &t.user, &t.nice, &t.system, &t.idle,
-                   &t.iowait, &t.irq, &t.softirq, &t.steal);
-            if (cpunum + 1 < max_cpus) {
+            if (sscanf(line + 3, "%d " CPU_TICK_FMT, &cpunum,
+                       &t.user, &t.nice, &t.system, &t.idle,
+                       &t.iowait, &t.irq, &t.softirq, &t.steal) == 9 &&
+                cpunum + 1 < max_cpus) {
                 ticks[cpunum + 1] = t;
                 idx = cpunum + 1;
             }
@@ -257,25 +271,21 @@ static void read_cpu_ticks(CpuTick ticks[], int *n_cpus) {
     fclose(f);
 }
 
+static unsigned long long tick_total(const CpuTick *t) {
+    return t->user + t->nice + t->system + t->idle +
+           t->iowait + t->irq + t->softirq + t->steal;
+}
+
 static void compute_cpu_usage(void) {
     memset(cur_ticks, 0, (max_cpus + 1) * sizeof(CpuTick));
     int n = 0;
     read_cpu_ticks(cur_ticks, &n);
-    if (n > max_cpus) n = max_cpus;
     num_cpus = n;
 
     for (int i = 0; i <= n; i++) {
         unsigned long long prev_idle  = prev_ticks[i].idle + prev_ticks[i].iowait;
         unsigned long long cur_idle   = cur_ticks[i].idle + cur_ticks[i].iowait;
-        unsigned long long prev_total = prev_ticks[i].user + prev_ticks[i].nice +
-                                        prev_ticks[i].system + prev_ticks[i].idle +
-                                        prev_ticks[i].iowait + prev_ticks[i].irq +
-                                        prev_ticks[i].softirq + prev_ticks[i].steal;
-        unsigned long long cur_total  = cur_ticks[i].user + cur_ticks[i].nice +
-                                        cur_ticks[i].system + cur_ticks[i].idle +
-                                        cur_ticks[i].iowait + cur_ticks[i].irq +
-                                        cur_ticks[i].softirq + cur_ticks[i].steal;
-        unsigned long long totald = cur_total - prev_total;
+        unsigned long long totald = tick_total(&cur_ticks[i]) - tick_total(&prev_ticks[i]);
         unsigned long long idled  = cur_idle - prev_idle;
         if (totald == 0)
             cpu_pct[i] = 0.0;
@@ -362,9 +372,9 @@ static void read_cpu_freqs(void) {
 
 static int tegra_gpu_available = 0;
 static char tegra_gpu_load_path[256] = "";
-static int tegra_gpu_therm_zone = -1; /* thermal zone index for GPU-therm */
 
-static int read_thermal_zones(double temps[], char types[][64]);
+/* Thermal zone type names that mean "GPU" on Tegra (matched per scrape) */
+static const char *const tegra_gpu_zone_names[] = { "GPU-therm", "gpu-thermal", NULL };
 
 static void detect_tegra_gpu(void) {
     /* Try known Tegra GPU load paths */
@@ -375,26 +385,12 @@ static void detect_tegra_gpu(void) {
         NULL
     };
     for (int i = 0; gpu_paths[i]; i++) {
-        FILE *f = fopen(gpu_paths[i], "r");
-        if (f) {
+        int v;
+        if (read_sysfs_int(gpu_paths[i], &v)) {
             tegra_gpu_available = 1;
             snprintf(tegra_gpu_load_path, sizeof(tegra_gpu_load_path), "%s", gpu_paths[i]);
-            fclose(f);
             break;
         }
-    }
-
-    /* Find GPU thermal zone (reuses the generic zone reader, which skips gaps) */
-    {
-        double temps[MAX_THERMAL_ZONES];
-        char types[MAX_THERMAL_ZONES][64];
-        int max = read_thermal_zones(temps, types);
-        for (int i = 0; i < max; i++)
-            if (strcasecmp(types[i], "GPU-therm") == 0 ||
-                strcasecmp(types[i], "gpu-thermal") == 0) {
-                tegra_gpu_therm_zone = i;
-                break;
-            }
     }
 }
 
@@ -406,74 +402,95 @@ static int read_tegra_gpu_util(void) {
 
 /* ── NIC ASIC temperature (ConnectX / mlx5) ─────────────────────────── */
 
-#define MAX_NIC_SENSORS 8
+#define MAX_NIC_SENSORS   8
+#define MAX_DRIVE_SENSORS 8
 
 static char nic_sensor_paths[MAX_NIC_SENSORS][128];
 static int  nic_sensor_count = 0;
+static char drive_sensor_paths[MAX_DRIVE_SENSORS][128];
+static char drive_sensor_labels[MAX_DRIVE_SENSORS][64];
+static int  drive_sensor_count = 0;
 
-static void detect_nic_asic_sensors(void) {
+/* Discover hwmon temperature sensors: mlx5 NIC ASICs and NVMe/HDD drives.
+ * Drive labels come from the hwmon device symlink (e.g. ".../nvme/nvme0" -> "nvme0"). */
+static void detect_hwmon_sensors(void) {
     DIR *dir = opendir("/sys/class/hwmon");
     if (!dir) return;
 
     struct dirent *ent = NULL;
-    while ((ent = readdir(dir)) && nic_sensor_count < MAX_NIC_SENSORS) {
+    while ((ent = readdir(dir))) {
         if (strncmp(ent->d_name, "hwmon", 5) != 0) continue;
 
-        char name[64] = "";
-        snprintf(name, sizeof(name), "/sys/class/hwmon/%s/name", ent->d_name);
-        FILE *f = fopen(name, "r");
-        if (f) {
-            if (fgets(name, sizeof(name), f))
-                name[strcspn(name, "\n\r")] = '\0';
-            fclose(f);
-        }
-        if (strcmp(name, "mlx5") != 0) continue;
+        char path[192], name[64] = "";
+        snprintf(path, sizeof(path), "/sys/class/hwmon/%s/name", ent->d_name);
+        read_sysfs_str(path, name, sizeof(name));
 
-        /* Verify temp1_input exists */
-        char path[192];
+        int is_nic   = strcmp(name, "mlx5") == 0;
+        int is_drive = strcmp(name, "nvme") == 0 || strcmp(name, "drivetemp") == 0;
+        if (!is_nic && !is_drive) continue;
+
+        /* Only record sensors we can actually read */
         snprintf(path, sizeof(path), "/sys/class/hwmon/%s/temp1_input", ent->d_name);
-        f = fopen(path, "r");
-        if (!f) continue;
-        fclose(f);
-        snprintf(nic_sensor_paths[nic_sensor_count],
-                 sizeof(nic_sensor_paths[0]), "%s", path);
-        nic_sensor_count++;
+        int v;
+        if (!read_sysfs_int(path, &v)) continue;
+
+        if (is_nic && nic_sensor_count < MAX_NIC_SENSORS) {
+            snprintf(nic_sensor_paths[nic_sensor_count],
+                     sizeof(nic_sensor_paths[0]), "%s", path);
+            nic_sensor_count++;
+        } else if (is_drive && drive_sensor_count < MAX_DRIVE_SENSORS) {
+            snprintf(drive_sensor_paths[drive_sensor_count],
+                     sizeof(drive_sensor_paths[0]), "%s", path);
+            char link[192], resolved[256];
+            snprintf(link, sizeof(link), "/sys/class/hwmon/%s/device", ent->d_name);
+            ssize_t rlen = readlink(link, resolved, sizeof(resolved) - 1);
+            if (rlen > 0) {
+                resolved[rlen] = '\0';
+                const char *base = strrchr(resolved, '/');
+                snprintf(drive_sensor_labels[drive_sensor_count],
+                         sizeof(drive_sensor_labels[0]), "%s", base ? base + 1 : resolved);
+            } else {
+                snprintf(drive_sensor_labels[drive_sensor_count],
+                         sizeof(drive_sensor_labels[0]), "%s", ent->d_name);
+            }
+            drive_sensor_count++;
+        }
     }
     closedir(dir);
+}
+
+/* Deg C from a hwmon temp*_input path, 0 if unreadable */
+static int read_hwmon_temp(const char *path) {
+    int millideg;
+    return read_sysfs_int(path, &millideg) ? millideg / 1000 : 0;
 }
 
 /* Return hottest ASIC temperature in deg C, 0 if no sensor found */
 static int read_nic_asic_temp(void) {
     int max_temp = 0;
     for (int i = 0; i < nic_sensor_count; i++) {
-        int millideg;
-        if (read_sysfs_int(nic_sensor_paths[i], &millideg) && millideg / 1000 > max_temp)
-            max_temp = millideg / 1000;
+        int t = read_hwmon_temp(nic_sensor_paths[i]);
+        if (t > max_temp) max_temp = t;
     }
     return max_temp;
-}
-
-/* ── Load average ───────────────────────────────────────────────────── */
-
-static void get_loadavg(double *l1, double *l5, double *l15) {
-    *l1 = *l5 = *l15 = 0.0;
-    FILE *f = fopen("/proc/loadavg", "r");
-    if (f) { (void)!fscanf(f, "%lf %lf %lf", l1, l5, l15); fclose(f); }
 }
 
 /* ── Network counters (emitted as Prometheus *_total) ───────────────── */
 
 #define MAX_NET_DEVS 32
+#ifndef NETDEV_PATH
+#define NETDEV_PATH "/proc/net/dev" /* test_thermal.c redefines this */
+#endif
 
 typedef struct {
     char name[64];
-    unsigned long long rx_bytes;
-    unsigned long long tx_bytes;
+    unsigned long long rx_bytes, rx_packets, rx_errs, rx_drop;
+    unsigned long long tx_bytes, tx_packets, tx_errs, tx_drop;
 } NetDev;
 
 /* Read per-interface counters (skips loopback). Returns count filled. */
 static int read_net_devices(NetDev *devs, int max) {
-    FILE *f = fopen("/proc/net/dev", "r");
+    FILE *f = fopen(NETDEV_PATH, "r");
     if (!f) return 0;
 
     int n = 0;
@@ -487,29 +504,96 @@ static int read_net_devices(NetDev *devs, int max) {
         if (!colon) continue;
         *colon = '\0';
 
-        char name[64];
-        snprintf(name, sizeof(name), "%s", line);
-        char *p = name;
+        char *p = line;
         while (*p == ' ') p++;
         if (strcmp(p, "lo") == 0) continue;
         if (n >= max) continue;
 
-        unsigned long long rx_bytes = 0, tx_bytes = 0;
-        unsigned long long discard[14];
+        /* v1 fields: rx bytes packets errs drop fifo frame compressed multicast,
+         * then tx bytes packets errs drop fifo colls carrier compressed */
+        unsigned long long v[16];
         if (sscanf(colon + 1,
                    " %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
-                   &rx_bytes,
-                   &discard[0], &discard[1], &discard[2], &discard[3], &discard[4], &discard[5], &discard[6],
-                   &tx_bytes,
-                   &discard[7], &discard[8], &discard[9], &discard[10], &discard[11], &discard[12], &discard[13]) == 16) {
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
+                   &v[8], &v[9], &v[10], &v[11], &v[12], &v[13], &v[14], &v[15]) == 16) {
             snprintf(devs[n].name, sizeof(devs[n].name), "%s", p);
-            devs[n].rx_bytes = rx_bytes;
-            devs[n].tx_bytes = tx_bytes;
+            devs[n].rx_bytes   = v[0];
+            devs[n].rx_packets = v[1];
+            devs[n].rx_errs    = v[2];
+            devs[n].rx_drop    = v[3];
+            devs[n].tx_bytes   = v[8];
+            devs[n].tx_packets = v[9];
+            devs[n].tx_errs    = v[10];
+            devs[n].tx_drop    = v[11];
             n++;
         }
     }
     fclose(f);
 
+    return n;
+}
+
+/* ── Disk I/O counters (/proc/diskstats, whole devices only) ────────── */
+
+#define MAX_DISK_DEVS 32
+#ifndef DISKSTATS_PATH
+#define DISKSTATS_PATH "/proc/diskstats" /* test_thermal.c redefines this */
+#endif
+
+typedef struct {
+    char name[64];
+    unsigned long long reads, writes;      /* completed ops */
+    unsigned long long rsectors, wsectors; /* 512-byte sectors */
+} DiskIO;
+
+/* Whole physical disks only: sda yes, sda1 no, nvme0n1 yes, nvme0n1p1 no,
+ * and nothing virtual (loop/ram/dm-/zram/sr/fd). */
+static int is_whole_disk(const char *name) {
+    char extra;
+    /* %c matches only if there are leftover chars ("p1"/"1" partitions);
+     * at end-of-string it yields EOF (-1). */
+    if (strncmp(name, "nvme", 4) == 0)
+        return sscanf(name, "nvme%*un%*u%c", &extra) <= 0;
+    if (strncmp(name, "mmcblk", 6) == 0)
+        return sscanf(name, "mmcblk%*u%c", &extra) <= 0;
+    if (strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0 ||
+        strncmp(name, "dm-", 3) == 0 || strncmp(name, "zram", 4) == 0 ||
+        strncmp(name, "sr", 2) == 0 || strncmp(name, "fd", 2) == 0)
+        return 0;
+    /* sd/hd/vd: whole disk has only letters after the 2-char prefix;
+     * xvd likewise after its 3 chars. Trailing digits mean a partition. */
+    int plen = (strncmp(name, "xvd", 3) == 0) ? 3 :
+               (strncmp(name, "sd", 2) == 0 || strncmp(name, "hd", 2) == 0 ||
+                strncmp(name, "vd", 2) == 0) ? 2 : 0;
+    if (!plen) return 0;
+    if (!name[plen]) return 0; /* prefix alone is not a disk */
+    for (const char *p = name + plen; *p; p++)
+        if (*p < 'a' || *p > 'z')
+            return 0;
+    return 1;
+}
+
+static int read_diskstats(DiskIO *devs, int max) {
+    FILE *f = fopen(DISKSTATS_PATH, "r");
+    if (!f) return 0;
+
+    int n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) && n < max) {
+        unsigned long long reads, rsect, writes, wsect, d1, d2, d3;
+        /* fields: f4=reads f6=rsectors f8=writes f10=wsectors (merged/ms skipped) */
+        if (sscanf(line, "%*d %*d %63s %llu %llu %llu %llu %llu %llu %llu",
+                   devs[n].name, &reads, &d1, &rsect, &d2, &writes, &d3, &wsect) != 8)
+            continue;
+        if (!is_whole_disk(devs[n].name))
+            continue;
+        devs[n].reads    = reads;
+        devs[n].writes   = writes;
+        devs[n].rsectors = rsect;
+        devs[n].wsectors = wsect;
+        n++;
+    }
+    fclose(f);
     return n;
 }
 
@@ -545,13 +629,15 @@ static void read_rdma_ports(void) {
 
         /* Scan ports (typically 1-2) */
         for (int p = 1; p <= 2 && idx < MAX_RDMA_PORTS; p++) {
-            char path[256];
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/state", dev_ent->d_name, p);
+            char base[192], path[256];
+            snprintf(base, sizeof(base), "/sys/class/infiniband/%s/ports/%d",
+                     dev_ent->d_name, p);
 
             RdmaPort *r = &rdma_ports[idx];
             snprintf(r->device, sizeof(r->device), "%s", dev_ent->d_name);
             r->port = p;
 
+            snprintf(path, sizeof(path), "%s/state", base);
             read_sysfs_str(path, r->state, sizeof(r->state));
             if (!r->state[0]) continue; /* no such port */
             /* Strip numeric prefix like "4: ACTIVE" -> "ACTIVE" */
@@ -562,18 +648,23 @@ static void read_rdma_ports(void) {
                 memmove(r->state, s, strlen(s) + 1);
             }
 
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/rate", dev_ent->d_name, p);
+            snprintf(path, sizeof(path), "%s/rate", base);
             read_sysfs_str(path, r->rate, sizeof(r->rate));
 
-            /* Counters — RDMA counters are in units of 4 bytes (32-bit words) for data */
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/counters/port_xmit_data", dev_ent->d_name, p);
-            r->xmit_bytes = read_sysfs_ull(path) * 4;
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/counters/port_rcv_data", dev_ent->d_name, p);
-            r->recv_bytes = read_sysfs_ull(path) * 4;
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/counters/port_xmit_packets", dev_ent->d_name, p);
-            r->xmit_pkts = read_sysfs_ull(path);
-            snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/counters/port_rcv_packets", dev_ent->d_name, p);
-            r->recv_pkts = read_sysfs_ull(path);
+            /* Data counters — data counters are in units of 4 bytes (32-bit words) */
+            const char *data_counters[] = {
+                "port_xmit_data", "port_rcv_data",
+                "port_xmit_packets", "port_rcv_packets"
+            };
+            unsigned long long vals[4];
+            for (int c = 0; c < 4; c++) {
+                snprintf(path, sizeof(path), "%s/counters/%s", base, data_counters[c]);
+                vals[c] = read_sysfs_ull(path);
+            }
+            r->xmit_bytes = vals[0] * 4;
+            r->recv_bytes = vals[1] * 4;
+            r->xmit_pkts  = vals[2];
+            r->recv_pkts  = vals[3];
 
             /* Sum error counters */
             r->errors = 0;
@@ -584,8 +675,7 @@ static void read_rdma_ports(void) {
                 NULL
             };
             for (int e = 0; err_counters[e]; e++) {
-                snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/counters/%s",
-                         dev_ent->d_name, p, err_counters[e]);
+                snprintf(path, sizeof(path), "%s/counters/%s", base, err_counters[e]);
                 r->errors += read_sysfs_ull(path);
             }
 
@@ -596,17 +686,72 @@ static void read_rdma_ports(void) {
     rdma_count = idx;
 }
 
+/* ── Disks ──────────────────────────────────────────────────────────── */
+
+#define MAX_DISKS 64
+
+typedef struct {
+    char mount[256];
+    char fstype[32];
+    char device[128];
+    unsigned long long total;
+    unsigned long long avail;
+    unsigned long long used;
+} Disk;
+
+/* Pseudo / virtual filesystems to skip (kernel-internal, not disk-backed) */
+static const char *const pseudo_fs[] = {
+    "tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs",
+    "cgroup", "cgroup2", "devpts", "mqueue", "hugetlbfs", "debugfs",
+    "tracefs", "fusectl", "configfs", "pstore", "bpf", "autofs",
+    "binfmt_misc", "rpc_pipefs", "nsfs", "securityfs", "efivarfs", NULL
+};
+
+/* Collect real device-backed mounts. Returns count filled. */
+static int read_disks(Disk *disks, int max) {
+    FILE *mf = setmntent("/proc/mounts", "r");
+    if (!mf) return 0;
+
+    int n = 0;
+    struct mntent *me;
+    while ((me = getmntent(mf)) != NULL && n < max) {
+        /* Only real device-backed mounts (filters out most pseudo fs) */
+        if (me->mnt_fsname[0] != '/') continue;
+        if (strncmp(me->mnt_fsname, "/dev/loop", 9) == 0) continue;
+        int skip = 0;
+        for (int i = 0; pseudo_fs[i]; i++)
+            if (strcmp(me->mnt_type, pseudo_fs[i]) == 0) { skip = 1; break; }
+        if (skip) continue;
+
+        struct statvfs sv;
+        if (statvfs(me->mnt_dir, &sv) != 0) continue;
+
+        unsigned long long total = (unsigned long long)sv.f_blocks * sv.f_frsize;
+        if (total == 0) continue;
+
+        snprintf(disks[n].mount, sizeof(disks[n].mount), "%s", me->mnt_dir);
+        snprintf(disks[n].fstype, sizeof(disks[n].fstype), "%s", me->mnt_type);
+        snprintf(disks[n].device, sizeof(disks[n].device), "%s", me->mnt_fsname);
+        disks[n].total = total;
+        disks[n].avail = (unsigned long long)sv.f_bavail * sv.f_frsize;
+        disks[n].used  = total - (unsigned long long)sv.f_bfree * sv.f_frsize;
+        n++;
+    }
+    endmntent(mf);
+    return n;
+}
+
 /* ── Prometheus metrics exporter ────────────────────────────────────── */
 
 static int   prom_sock = -1;
 static pthread_t prom_thread;
 
-#define PROM_BYTES_PER_GPU 512  /* estimated Prometheus output per GPU */
-#define PROM_BASE_SIZE 8192     /* base buffer for CPU/memory/system metrics */
+#define PROM_BUF_SIZE (1 << 18) /* 256 KB fixed budget, allocated once at server start */
 
 typedef struct {
     char     name[96];
-    unsigned int util_gpu;
+    char     uuid[96];
+    unsigned int util_gpu, util_mem;
     unsigned int temp;
     unsigned int power_mw;
     int      has_power;
@@ -617,7 +762,17 @@ typedef struct {
     int      has_fan;
     unsigned int enc, dec;
     int      has_enc, has_dec;
+    unsigned int pstate;
+    int      has_pstate;
+    unsigned long long throttle;   /* raw clocks-event-reasons bitmask */
+    int      has_throttle;
+    unsigned long long energy_mj;
+    int      has_energy;
+    unsigned int replay;
+    int      has_replay;
 } PromGpu;
+
+static char driver_ver[80] = ""; /* set once at startup when NVML is present */
 
 static int      prom_buf_size = 0;
 static char    *prom_body = NULL;
@@ -645,19 +800,27 @@ static int read_thermal_zones(double temps[], char types[][64]) {
 /* Format all metrics into buf. Returns bytes written. */
 static int format_metrics(char *buf, int buflen) {
     int off = 0;
+    static int trunc_warned = 0;
 
     #define PM(...) do { \
         int _n = snprintf(buf + off, (size_t)(buflen - off), __VA_ARGS__); \
         if (_n > 0) { \
-            if (_n >= buflen - off) { off = buflen - 1; goto pm_done; } \
+            if (_n >= buflen - off) { \
+                off = buflen - 1; \
+                if (!trunc_warned) { \
+                    fprintf(stderr, "warning: metrics truncated at %d bytes — raise PROM_BUF_SIZE\n", buflen); \
+                    trunc_warned = 1; \
+                } \
+                goto pm_done; \
+            } \
             off += _n; \
         } \
     } while(0)
 
-    /* Build info */
+    /* Build info (driver from NVML when present) */
     PM("# HELP nv_build_info nv-monitor version\n"
        "# TYPE nv_build_info gauge\n"
-       "nv_build_info{version=\"%s\"} 1\n", VERSION);
+       "nv_build_info{version=\"%s\",driver=\"%s\"} 1\n", VERSION, driver_ver);
 
     /* Uptime */
     struct sysinfo si;
@@ -668,13 +831,13 @@ static int format_metrics(char *buf, int buflen) {
     }
 
     /* Load average */
-    double l1 = 0, l5 = 0, l15 = 0;
-    get_loadavg(&l1, &l5, &l15);
+    double load[3] = {0, 0, 0};
+    getloadavg(load, 3);
     PM("# HELP nv_load_average System load average\n"
        "# TYPE nv_load_average gauge\n"
        "nv_load_average{interval=\"1m\"} %.2f\n"
        "nv_load_average{interval=\"5m\"} %.2f\n"
-       "nv_load_average{interval=\"15m\"} %.2f\n", l1, l5, l15);
+       "nv_load_average{interval=\"15m\"} %.2f\n", load[0], load[1], load[2]);
 
     /* CPU usage — delta since the previous scrape */
     compute_cpu_usage();
@@ -683,6 +846,20 @@ static int format_metrics(char *buf, int buflen) {
     for (int i = 1; i <= num_cpus; i++)
         PM("nv_cpu_usage_percent{cpu=\"%d\",type=\"%s\"} %.1f\n",
            i - 1, cpu_part_label(i - 1), cpu_pct[i]);
+
+    /* Cumulative CPU time per mode (aggregate since boot).
+     * CpuTick is exactly 8 adjacent u64 fields — indexable as an array. */
+    {
+        static const char *const modes[8] = {
+            "user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"
+        };
+        const unsigned long long *agg = (const unsigned long long *)&cur_ticks[0];
+        double hz = (double)sysconf(_SC_CLK_TCK);
+        PM("# HELP nv_cpu_seconds_total Cumulative CPU time per mode\n"
+           "# TYPE nv_cpu_seconds_total counter\n");
+        for (int m = 0; m < 8; m++)
+            PM("nv_cpu_seconds_total{mode=\"%s\"} %.1f\n", modes[m], agg[m] / hz);
+    }
 
     /* Per-thermal-zone temperatures (zone index + kernel zone type) */
     double tz_temp[MAX_THERMAL_ZONES] = {0};
@@ -742,6 +919,39 @@ static int format_metrics(char *buf, int buflen) {
         for (int i = 0; i < n_net; i++)
             PM("nv_network_transmit_bytes_total{device=\"%s\"} %llu\n",
                net_devs[i].name, net_devs[i].tx_bytes);
+
+        PM("# HELP nv_network_receive_packets_total Total packets received per network interface\n"
+           "# TYPE nv_network_receive_packets_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_receive_packets_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].rx_packets);
+        PM("# HELP nv_network_transmit_packets_total Total packets transmitted per network interface\n"
+           "# TYPE nv_network_transmit_packets_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_transmit_packets_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].tx_packets);
+
+        PM("# HELP nv_network_receive_errors_total Receive errors per network interface\n"
+           "# TYPE nv_network_receive_errors_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_receive_errors_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].rx_errs);
+        PM("# HELP nv_network_transmit_errors_total Transmit errors per network interface\n"
+           "# TYPE nv_network_transmit_errors_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_transmit_errors_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].tx_errs);
+
+        PM("# HELP nv_network_receive_dropped_total Packets dropped on receive per network interface\n"
+           "# TYPE nv_network_receive_dropped_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_receive_dropped_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].rx_drop);
+        PM("# HELP nv_network_transmit_dropped_total Packets dropped on transmit per network interface\n"
+           "# TYPE nv_network_transmit_dropped_total counter\n");
+        for (int i = 0; i < n_net; i++)
+            PM("nv_network_transmit_dropped_total{device=\"%s\"} %llu\n",
+               net_devs[i].name, net_devs[i].tx_drop);
     }
 
     int nic_temp = read_nic_asic_temp();
@@ -751,91 +961,60 @@ static int format_metrics(char *buf, int buflen) {
            "nv_nic_asic_temperature_celsius %d\n", nic_temp);
     }
 
-    /* Disk usage per real mountpoint (skip pseudo/virtual fs) */
-    {
-        struct {
-            char mount[256];
-            char fstype[32];
-            char device[128];
-            unsigned long long total;
-            unsigned long long avail;
-            unsigned long long used;
-        } disks[64];
-        int n_disks = 0;
-
-        FILE *mf = setmntent("/proc/mounts", "r");
-        if (mf) {
-            struct mntent *me;
-            while ((me = getmntent(mf)) != NULL && n_disks < 64) {
-                /* Skip pseudo / virtual filesystems */
-                if (strcmp(me->mnt_type, "tmpfs") == 0 ||
-                    strcmp(me->mnt_type, "devtmpfs") == 0 ||
-                    strcmp(me->mnt_type, "overlay") == 0 ||
-                    strcmp(me->mnt_type, "squashfs") == 0 ||
-                    strcmp(me->mnt_type, "proc") == 0 ||
-                    strcmp(me->mnt_type, "sysfs") == 0 ||
-                    strcmp(me->mnt_type, "cgroup") == 0 ||
-                    strcmp(me->mnt_type, "cgroup2") == 0 ||
-                    strcmp(me->mnt_type, "devpts") == 0 ||
-                    strcmp(me->mnt_type, "mqueue") == 0 ||
-                    strcmp(me->mnt_type, "hugetlbfs") == 0 ||
-                    strcmp(me->mnt_type, "debugfs") == 0 ||
-                    strcmp(me->mnt_type, "tracefs") == 0 ||
-                    strcmp(me->mnt_type, "fusectl") == 0 ||
-                    strcmp(me->mnt_type, "configfs") == 0 ||
-                    strcmp(me->mnt_type, "pstore") == 0 ||
-                    strcmp(me->mnt_type, "bpf") == 0 ||
-                    strcmp(me->mnt_type, "autofs") == 0 ||
-                    strcmp(me->mnt_type, "binfmt_misc") == 0 ||
-                    strcmp(me->mnt_type, "rpc_pipefs") == 0 ||
-                    strcmp(me->mnt_type, "nsfs") == 0 ||
-                    strcmp(me->mnt_type, "securityfs") == 0 ||
-                    strcmp(me->mnt_type, "efivarfs") == 0 ||
-                    strncmp(me->mnt_fsname, "/dev/loop", 9) == 0)
-                    continue;
-                /* Only real device-backed mounts */
-                if (me->mnt_fsname[0] != '/')
-                    continue;
-
-                struct statvfs sv;
-                if (statvfs(me->mnt_dir, &sv) != 0)
-                    continue;
-
-                unsigned long long total = (unsigned long long)sv.f_blocks * sv.f_frsize;
-                unsigned long long avail = (unsigned long long)sv.f_bavail * sv.f_frsize;
-                if (total == 0)
-                    continue;
-                unsigned long long used = total - (unsigned long long)sv.f_bfree * sv.f_frsize;
-
-                snprintf(disks[n_disks].mount, sizeof(disks[n_disks].mount), "%s", me->mnt_dir);
-                snprintf(disks[n_disks].fstype, sizeof(disks[n_disks].fstype), "%s", me->mnt_type);
-                snprintf(disks[n_disks].device, sizeof(disks[n_disks].device), "%s", me->mnt_fsname);
-                disks[n_disks].total = total;
-                disks[n_disks].avail = avail;
-                disks[n_disks].used = used;
-                n_disks++;
-            }
-            endmntent(mf);
+    if (drive_sensor_count > 0) {
+        PM("# HELP nv_drive_temperature_celsius NVMe/HDD drive temperature\n"
+           "# TYPE nv_drive_temperature_celsius gauge\n");
+        for (int i = 0; i < drive_sensor_count; i++) {
+            int t = read_hwmon_temp(drive_sensor_paths[i]);
+            if (t > 0)
+                PM("nv_drive_temperature_celsius{device=\"%s\"} %d\n",
+                   drive_sensor_labels[i], t);
         }
+    }
 
-        if (n_disks > 0) {
-            PM("# HELP nv_disk_total_bytes Filesystem total size\n"
-               "# TYPE nv_disk_total_bytes gauge\n");
-            for (int i = 0; i < n_disks; i++)
-                PM("nv_disk_total_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
-                   disks[i].mount, disks[i].device, disks[i].fstype, disks[i].total);
+    /* Disk usage per real mountpoint */
+    Disk disks[MAX_DISKS];
+    int n_disks = read_disks(disks, MAX_DISKS);
+    if (n_disks > 0) {
+        PM("# HELP nv_disk_total_bytes Filesystem total size\n"
+           "# TYPE nv_disk_total_bytes gauge\n");
+        for (int i = 0; i < n_disks; i++)
+            PM("nv_disk_total_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
+               disks[i].mount, disks[i].device, disks[i].fstype, disks[i].total);
 
-            PM("# HELP nv_disk_used_bytes Filesystem used bytes\n"
-               "# TYPE nv_disk_used_bytes gauge\n");
-            for (int i = 0; i < n_disks; i++)
-                PM("nv_disk_used_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
-                   disks[i].mount, disks[i].device, disks[i].fstype, disks[i].used);
+        PM("# HELP nv_disk_used_bytes Filesystem used bytes\n"
+           "# TYPE nv_disk_used_bytes gauge\n");
+        for (int i = 0; i < n_disks; i++)
+            PM("nv_disk_used_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
+               disks[i].mount, disks[i].device, disks[i].fstype, disks[i].used);
 
-            PM("# HELP nv_disk_avail_bytes Filesystem available bytes\n"
-               "# TYPE nv_disk_avail_bytes gauge\n");
-            for (int i = 0; i < n_disks; i++)
-                PM("nv_disk_avail_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
-                   disks[i].mount, disks[i].device, disks[i].fstype, disks[i].avail);
+        PM("# HELP nv_disk_avail_bytes Filesystem available bytes\n"
+           "# TYPE nv_disk_avail_bytes gauge\n");
+        for (int i = 0; i < n_disks; i++)
+            PM("nv_disk_avail_bytes{mountpoint=\"%s\",device=\"%s\",fstype=\"%s\"} %llu\n",
+               disks[i].mount, disks[i].device, disks[i].fstype, disks[i].avail);
+    }
+
+    /* Per-disk I/O counters (whole physical devices, kernel sectors are 512 B) */
+    DiskIO io_devs[MAX_DISK_DEVS];
+    int n_io = read_diskstats(io_devs, MAX_DISK_DEVS);
+    if (n_io > 0) {
+        static const char *const io_names[4] = {
+            "nv_disk_reads_completed_total", "nv_disk_writes_completed_total",
+            "nv_disk_read_bytes_total", "nv_disk_written_bytes_total"
+        };
+        static const char *const io_help[4] = {
+            "Completed read operations", "Completed write operations",
+            "Bytes read", "Bytes written"
+        };
+        for (int m = 0; m < 4; m++) {
+            PM("# HELP %s %s per physical disk\n# TYPE %s counter\n",
+               io_names[m], io_help[m], io_names[m]);
+            for (int i = 0; i < n_io; i++) {
+                unsigned long long v = m < 2 ? (m == 0 ? io_devs[i].reads : io_devs[i].writes)
+                                             : (m == 2 ? io_devs[i].rsectors : io_devs[i].wsectors) * 512ULL;
+                PM("%s{device=\"%s\"} %llu\n", io_names[m], io_devs[i].name, v);
+            }
         }
     }
 
@@ -844,31 +1023,46 @@ static int format_metrics(char *buf, int buflen) {
     int n_gpus = 0;
 
     if (nvml_ok) {
-        unsigned int dev_count = 0;
-        pNvmlDeviceGetCount(&dev_count);
-
-        for (unsigned int d = 0; gpus && d < dev_count && d < gpu_count; d++) {
+        for (unsigned int d = 0; gpus && d < gpu_count; d++) {
             PromGpu *g = &gpus[n_gpus];
             memset(g, 0, sizeof(*g));
             nvmlDevice_t dev;
             if (pNvmlDeviceGetHandleByIndex(d, &dev) != NVML_SUCCESS) continue;
             pNvmlDeviceGetName(dev, g->name, sizeof(g->name));
+            if (pNvmlDeviceGetUUID)
+                pNvmlDeviceGetUUID(dev, g->uuid, sizeof(g->uuid));
 
-            nvmlUtilization_t util = {0};
-            if (!tegra_gpu_available && pNvmlDeviceGetUtilizationRates)
-                pNvmlDeviceGetUtilizationRates(dev, &util);
             if (tegra_gpu_available) {
+                /* Tegra sysfs overrides NVML, which returns zeros there */
                 int tutil = read_tegra_gpu_util();
-                if (tutil >= 0) util.gpu = (unsigned int)tutil;
+                if (tutil >= 0) g->util_gpu = (unsigned int)tutil;
+                for (int z = 0; z < tz_max; z++)
+                    for (int k = 0; tegra_gpu_zone_names[k]; k++)
+                        if (strcasecmp(tz_type[z], tegra_gpu_zone_names[k]) == 0) {
+                            g->temp = (unsigned int)tz_temp[z];
+                            break;
+                        }
+            } else {
+                if (pNvmlDeviceGetUtilizationRates) {
+                    nvmlUtilization_t util = {0};
+                    pNvmlDeviceGetUtilizationRates(dev, &util);
+                    g->util_gpu = util.gpu;
+                    g->util_mem = util.memory;
+                }
+                if (pNvmlDeviceGetTemperature)
+                    pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &g->temp);
+                /* Optional per-platform counters (GB10: throttle yes, energy no) */
+                int ps;
+                g->has_pstate = (pNvmlDeviceGetPerformanceState &&
+                                 pNvmlDeviceGetPerformanceState(dev, &ps) == NVML_SUCCESS);
+                if (g->has_pstate) g->pstate = (unsigned int)ps;
+                g->has_throttle = (pNvmlDeviceGetCurrClocksThrottleReasons &&
+                                   pNvmlDeviceGetCurrClocksThrottleReasons(dev, &g->throttle) == NVML_SUCCESS);
+                g->has_energy = (pNvmlDeviceGetTotalEnergyConsumption &&
+                                 pNvmlDeviceGetTotalEnergyConsumption(dev, &g->energy_mj) == NVML_SUCCESS);
+                g->has_replay = (pNvmlDeviceGetPcieReplayCounter &&
+                                 pNvmlDeviceGetPcieReplayCounter(dev, &g->replay) == NVML_SUCCESS);
             }
-            g->util_gpu = util.gpu;
-
-            if (!tegra_gpu_available && pNvmlDeviceGetTemperature)
-                pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &g->temp);
-            if (tegra_gpu_available &&
-                tegra_gpu_therm_zone >= 0 && tegra_gpu_therm_zone < tz_max &&
-                tz_temp[tegra_gpu_therm_zone] > 0)
-                g->temp = (unsigned int)tz_temp[tegra_gpu_therm_zone];
 
             g->has_power = (pNvmlDeviceGetPowerUsage &&
                             pNvmlDeviceGetPowerUsage(dev, &g->power_mw) == NVML_SUCCESS);
@@ -899,12 +1093,17 @@ static int format_metrics(char *buf, int buflen) {
         PM("# HELP nv_gpu_info GPU device information\n"
            "# TYPE nv_gpu_info gauge\n");
         for (int d = 0; d < n_gpus; d++)
-            PM("nv_gpu_info{gpu=\"%d\",name=\"%s\"} 1\n", d, gpus[d].name);
+            PM("nv_gpu_info{gpu=\"%d\",name=\"%s\",uuid=\"%s\"} 1\n", d, gpus[d].name, gpus[d].uuid);
 
         PM("# HELP nv_gpu_utilization_percent GPU compute utilization\n"
            "# TYPE nv_gpu_utilization_percent gauge\n");
         for (int d = 0; d < n_gpus; d++)
             PM("nv_gpu_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_gpu);
+
+        PM("# HELP nv_gpu_memory_utilization_percent GPU memory controller utilization\n"
+           "# TYPE nv_gpu_memory_utilization_percent gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            PM("nv_gpu_memory_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_mem);
 
         PM("# HELP nv_gpu_temperature_celsius GPU temperature\n"
            "# TYPE nv_gpu_temperature_celsius gauge\n");
@@ -956,6 +1155,38 @@ static int format_metrics(char *buf, int buflen) {
             if (gpus[d].has_dec)
                 PM("nv_gpu_decoder_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].dec);
 
+        if (gpus[0].has_pstate) {
+            PM("# HELP nv_gpu_performance_state GPU performance state (P0=max, higher is more idle)\n"
+               "# TYPE nv_gpu_performance_state gauge\n");
+            for (int d = 0; d < n_gpus; d++)
+                if (gpus[d].has_pstate)
+                    PM("nv_gpu_performance_state{gpu=\"%d\"} %u\n", d, gpus[d].pstate);
+        }
+
+        if (gpus[0].has_throttle) {
+            /* Raw NVML clocks-event-reasons bitmask (same field DCGM exports) */
+            PM("# HELP nv_gpu_clocks_event_reasons Active clock throttle reasons (bitmask)\n"
+               "# TYPE nv_gpu_clocks_event_reasons gauge\n");
+            for (int d = 0; d < n_gpus; d++)
+                if (gpus[d].has_throttle)
+                    PM("nv_gpu_clocks_event_reasons{gpu=\"%d\"} %llu\n", d, gpus[d].throttle);
+        }
+
+        if (gpus[0].has_energy) {
+            PM("# HELP nv_gpu_energy_millijoules_total Cumulative GPU energy consumed\n"
+               "# TYPE nv_gpu_energy_millijoules_total counter\n");
+            for (int d = 0; d < n_gpus; d++)
+                if (gpus[d].has_energy)
+                    PM("nv_gpu_energy_millijoules_total{gpu=\"%d\"} %llu\n", d, gpus[d].energy_mj);
+        }
+
+        if (gpus[0].has_replay) {
+            PM("# HELP nv_gpu_pcie_replay_total PCIe TLP replay counter (link health)\n"
+               "# TYPE nv_gpu_pcie_replay_total counter\n");
+            for (int d = 0; d < n_gpus; d++)
+                if (gpus[d].has_replay)
+                    PM("nv_gpu_pcie_replay_total{gpu=\"%d\"} %u\n", d, gpus[d].replay);
+        }
     }
 
     /* RDMA / InfiniBand */
@@ -1016,11 +1247,9 @@ static void prom_handle(int fd) {
     if (n <= 0) return;
     req[n] = '\0';
 
-    /* Bearer token auth if configured */
+    /* Bearer token auth if configured (expected header built once in main) */
     if (prom_token) {
-        char expected[512];
-        snprintf(expected, sizeof(expected), "Authorization: Bearer %s", prom_token);
-        if (!strstr(req, expected)) {
+        if (!strstr(req, prom_expected_hdr)) {
             static const char resp_401[] =
                 "HTTP/1.1 401 Unauthorized\r\n"
                 "Content-Type: text/plain\r\n"
@@ -1061,9 +1290,7 @@ static void prom_handle(int fd) {
 static void *prom_server(void *arg) {
     (void)arg;
     /* Pre-allocate buffers once for the lifetime of the thread */
-    prom_buf_size = PROM_BASE_SIZE + (gpu_count * PROM_BYTES_PER_GPU) +
-                    (num_cpus * 80) + (MAX_THERMAL_ZONES * 128) +
-                    (MAX_NET_DEVS * 128) + 512;
+    prom_buf_size = PROM_BUF_SIZE;
     prom_body = malloc(prom_buf_size);
     prom_gpus = calloc(gpu_count > 0 ? gpu_count : 1, sizeof(PromGpu));
 
@@ -1101,16 +1328,12 @@ static int prom_start(void) {
 
     if (bind(prom_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("prometheus: bind");
-        close(prom_sock);
-        prom_sock = -1;
-        return -1;
+        goto fail;
     }
 
     if (listen(prom_sock, 4) < 0) {
         perror("prometheus: listen");
-        close(prom_sock);
-        prom_sock = -1;
-        return -1;
+        goto fail;
     }
 
     pthread_attr_t attr;
@@ -1119,15 +1342,18 @@ static int prom_start(void) {
 
     if (pthread_create(&prom_thread, &attr, prom_server, NULL) != 0) {
         perror("prometheus: pthread_create");
-        close(prom_sock);
-        prom_sock = -1;
         pthread_attr_destroy(&attr);
-        return -1;
+        goto fail;
     }
 
     pthread_attr_destroy(&attr);
     fprintf(stderr, "Prometheus metrics at http://0.0.0.0:%d/metrics\n", prom_port);
     return 0;
+
+fail:
+    close(prom_sock);
+    prom_sock = -1;
+    return -1;
 }
 
 static void prom_stop(void) {
@@ -1179,6 +1405,9 @@ int main(int argc, char *argv[]) {
     /* Token: CLI flag takes precedence, then env var */
     if (!prom_token)
         prom_token = getenv("NV_MONITOR_TOKEN");
+    if (prom_token)
+        snprintf(prom_expected_hdr, sizeof(prom_expected_hdr),
+                 "Authorization: Bearer %s", prom_token);
 
     if (!prom_port) {
         fprintf(stderr, "Error: -p <port> is required\n");
@@ -1189,11 +1418,13 @@ int main(int argc, char *argv[]) {
     nvml_ok = (load_nvml() == 0);
     if (nvml_ok && pNvmlDeviceGetCount)
         pNvmlDeviceGetCount(&gpu_count);
+    if (nvml_ok && pNvmlSystemGetDriverVersion)
+        pNvmlSystemGetDriverVersion(driver_ver, sizeof(driver_ver));
 
     /* Detect Tegra GPU sysfs (Jetson fallback); when detected, the scrape
      * path prefers Tegra sysfs over NVML, which returns zeros there */
     detect_tegra_gpu();
-    detect_nic_asic_sensors();
+    detect_hwmon_sensors();
 
     /* Detect CPU count and allocate arrays */
     max_cpus = (int)sysconf(_SC_NPROCESSORS_CONF);
