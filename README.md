@@ -68,10 +68,11 @@ curl -s localhost:9101/metrics     # Check it works
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nv_build_info` | gauge | `version` | nv-monitor version |
+| `nv_build_info` | gauge | `version`, `driver` | nv-monitor version and NVIDIA driver version |
 | `nv_uptime_seconds` | gauge | | System uptime |
 | `nv_load_average` | gauge | `interval` | Load average (1m, 5m, 15m) |
 | `nv_cpu_usage_percent` | gauge | `cpu`, `type` | Per-core CPU utilization (type = ARM core: X925, X725, etc.; `unknown` on x86) |
+| `nv_cpu_seconds_total` | counter | `mode` | Cumulative CPU time per mode (`user`, `system`, `iowait`, `steal`, …) — `rate()` for iowait/steal trends |
 | `nv_thermal_zone_temperature_celsius` | gauge | `zone`, `type` | Per-thermal-zone temperature (e.g. cpu-therm, GPU-therm) |
 | `nv_cpu_frequency_mhz` | gauge | `cpu`, `type` | Per-core CPU frequency (type = ARM core, `unknown` on x86) |
 | `nv_memory_total_bytes` | gauge | | Total system memory |
@@ -79,19 +80,39 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_memory_bufcache_bytes` | gauge | | Buffer and cache memory |
 | `nv_swap_total_bytes` | gauge | | Total swap |
 | `nv_swap_used_bytes` | gauge | | Swap used |
+| `nv_network_receive_bytes_total`, `nv_network_transmit_bytes_total` | counter | `device` | Per-interface traffic (loopback skipped) |
+| `nv_network_receive_packets_total`, `nv_network_transmit_packets_total` | counter | `device` | Per-interface packet counts |
+| `nv_network_receive_errors_total`, `nv_network_transmit_errors_total` | counter | `device` | Per-interface link errors |
+| `nv_network_receive_dropped_total`, `nv_network_transmit_dropped_total` | counter | `device` | Per-interface dropped packets |
+| `nv_nic_asic_temperature_celsius` | gauge | | Hottest NIC ASIC (mlx5/ConnectX hwmon) |
+| `nv_drive_temperature_celsius` | gauge | `device` | NVMe/HDD temperature (hwmon, e.g. `device="nvme0"`) |
 | `nv_disk_total_bytes` | gauge | `mountpoint`, `device`, `fstype` | Filesystem total size (per real mount) |
 | `nv_disk_used_bytes` | gauge | `mountpoint`, `device`, `fstype` | Filesystem used bytes |
 | `nv_disk_avail_bytes` | gauge | `mountpoint`, `device`, `fstype` | Filesystem available bytes |
-| `nv_gpu_info` | gauge | `gpu`, `name` | GPU device name |
+| `nv_disk_reads_completed_total`, `nv_disk_writes_completed_total` | counter | `device` | Completed I/O ops per physical disk (partitions/virtual excluded) |
+| `nv_disk_read_bytes_total`, `nv_disk_written_bytes_total` | counter | `device` | Throughput bytes per physical disk |
+| `nv_gpu_info` | gauge | `gpu`, `name`, `uuid` | GPU identity (uuid omitted where unsupported, e.g. Jetson) |
 | `nv_gpu_utilization_percent` | gauge | `gpu` | GPU compute utilization |
+| `nv_gpu_memory_utilization_percent` | gauge | `gpu` | GPU memory controller utilization (reads 0 on unified memory) |
 | `nv_gpu_temperature_celsius` | gauge | `gpu` | GPU temperature |
 | `nv_gpu_power_watts` | gauge | `gpu` | GPU power draw |
 | `nv_gpu_clock_mhz` | gauge | `gpu`, `type` | GPU clock speed (graphics, memory) |
-| `nv_gpu_memory_total_bytes` | gauge | `gpu` | GPU memory total |
-| `nv_gpu_memory_used_bytes` | gauge | `gpu` | GPU memory used |
+| `nv_gpu_memory_total_bytes` | gauge | `gpu` | GPU memory total (omitted on unified-memory GB10) |
+| `nv_gpu_memory_used_bytes` | gauge | `gpu` | GPU memory used (omitted on unified-memory GB10) |
 | `nv_gpu_fan_speed_percent` | gauge | `gpu` | Fan speed |
 | `nv_gpu_encoder_utilization_percent` | gauge | `gpu` | Hardware encoder utilization |
 | `nv_gpu_decoder_utilization_percent` | gauge | `gpu` | Hardware decoder utilization |
+| `nv_gpu_performance_state` | gauge | `gpu` | P-state (0 = P0 / max clocks) |
+| `nv_gpu_clocks_event_reasons` | gauge | `gpu` | Live throttle-reason bitmask (NVML/DCGM format) |
+| `nv_gpu_throttle_duration_seconds_total` | counter | `gpu`, `reason` | Cumulative time clocks were held down per cause (`sw_power_cap`, `sw_thermal_slowdown`, `sync_boost`, `board_limit`, `low_utilization`, `reliability`) — `rate()` = throttle duty cycle |
+| `nv_gpu_energy_millijoules_total` | counter | `gpu` | Cumulative GPU energy (`rate()/1000` = average watts) |
+| `nv_gpu_pcie_replay_total` | counter | `gpu` | PCIe TLP replays (link-health counter) |
+| `nv_rdma_info` | gauge | `device`, `port`, `state`, `rate` | RDMA port state and link rate |
+| `nv_rdma_xmit_bytes_total`, `nv_rdma_recv_bytes_total` | counter | `device`, `port` | RDMA port traffic |
+| `nv_rdma_xmit_packets_total`, `nv_rdma_recv_packets_total` | counter | `device`, `port` | RDMA port packet counts |
+| `nv_rdma_errors_total` | counter | `device`, `port` | Sum of RDMA error counters |
+
+GPU metrics gated on NVML support (`uuid`, `performance_state`, `clocks_event_reasons`, `throttle_duration`, `energy`, `pcie_replay`) are omitted silently where the driver/SoC does not expose them. On a DGX Spark (GB10) everything above emits except `gpu_memory_*` (unified memory) and `fan_speed` (no sensor).
 
 ### Prometheus scrape config
 
@@ -104,7 +125,7 @@ scrape_configs:
       - targets: ['dgx-spark:9101']
 ```
 
-No new dependencies are required — the exporter uses POSIX sockets and adds ~128 KB of memory overhead.
+No new dependencies are required — the exporter uses POSIX sockets and adds ~256 KB of memory overhead.
 
 ### Security
 
