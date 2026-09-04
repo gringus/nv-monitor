@@ -45,6 +45,13 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
+/* Cumulative clock-limit violation time (nvmlPerfPolicyType 0..5);
+ * violationTime in nanoseconds. DEPRECATED in NVML 13 — probes degrade to absent. */
+typedef struct {
+    unsigned long long referenceTime;
+    unsigned long long violationTime;
+} nvmlViolationTime_t;
+
 #define NVML_SUCCESS 0
 #define NVML_TEMPERATURE_GPU 0
 #define NVML_CLOCK_GRAPHICS 0
@@ -70,6 +77,7 @@ static nvmlReturn_t (*pNvmlDeviceGetTotalEnergyConsumption)(nvmlDevice_t, unsign
 static nvmlReturn_t (*pNvmlDeviceGetPcieReplayCounter)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetUUID)(nvmlDevice_t, char *, unsigned int);
 static nvmlReturn_t (*pNvmlSystemGetDriverVersion)(char *, unsigned int);
+static nvmlReturn_t (*pNvmlDeviceGetViolationStatus)(nvmlDevice_t, int, nvmlViolationTime_t *);
 
 static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
@@ -159,6 +167,7 @@ static int load_nvml(void) {
     LOAD(pNvmlDeviceGetPcieReplayCounter,         "nvmlDeviceGetPcieReplayCounter");
     LOAD(pNvmlDeviceGetUUID,                      "nvmlDeviceGetUUID_v2", "nvmlDeviceGetUUID");
     LOAD(pNvmlSystemGetDriverVersion,             "nvmlSystemGetDriverVersion_v2", "nvmlSystemGetDriverVersion");
+    LOAD(pNvmlDeviceGetViolationStatus,           "nvmlDeviceGetViolationStatus");
     #undef LOAD
 
     if (!pNvmlInit) return -1;
@@ -770,7 +779,15 @@ typedef struct {
     int      has_energy;
     unsigned int replay;
     int      has_replay;
+    unsigned long long viol_ns[6]; /* per nvmlPerfPolicyType 0..5 */
+    int      has_viol[6];
 } PromGpu;
+
+/* Label names for nvmlPerfPolicyType 0..5 (policy indices are the array order) */
+static const char *const viol_reasons[6] = {
+    "sw_power_cap", "sw_thermal_slowdown", "sync_boost",
+    "board_limit", "low_utilization", "reliability"
+};
 
 static char driver_ver[80] = ""; /* set once at startup when NVML is present */
 
@@ -1062,6 +1079,13 @@ static int format_metrics(char *buf, int buflen) {
                                  pNvmlDeviceGetTotalEnergyConsumption(dev, &g->energy_mj) == NVML_SUCCESS);
                 g->has_replay = (pNvmlDeviceGetPcieReplayCounter &&
                                  pNvmlDeviceGetPcieReplayCounter(dev, &g->replay) == NVML_SUCCESS);
+                if (pNvmlDeviceGetViolationStatus) {
+                    for (int v = 0; v < 6; v++) {
+                        nvmlViolationTime_t vt = {0};
+                        g->has_viol[v] = (pNvmlDeviceGetViolationStatus(dev, v, &vt) == NVML_SUCCESS);
+                        if (g->has_viol[v]) g->viol_ns[v] = vt.violationTime;
+                    }
+                }
             }
 
             g->has_power = (pNvmlDeviceGetPowerUsage &&
@@ -1170,6 +1194,19 @@ static int format_metrics(char *buf, int buflen) {
             for (int d = 0; d < n_gpus; d++)
                 if (gpus[d].has_throttle)
                     PM("nv_gpu_clocks_event_reasons{gpu=\"%d\"} %llu\n", d, gpus[d].throttle);
+        }
+
+        /* Cumulative time clocks were held below application clocks per cause.
+         * Unlike the event-reasons bitmask, rate() of this never misses a
+         * throttle spike between scrapes. */
+        if (gpus[0].has_viol[0]) {
+            PM("# HELP nv_gpu_throttle_duration_seconds_total Cumulative time GPU clocks were limited, per cause\n"
+               "# TYPE nv_gpu_throttle_duration_seconds_total counter\n");
+            for (int d = 0; d < n_gpus; d++)
+                for (int v = 0; v < 6; v++)
+                    if (gpus[d].has_viol[v])
+                        PM("nv_gpu_throttle_duration_seconds_total{gpu=\"%d\",reason=\"%s\"} %.6f\n",
+                           d, viol_reasons[v], gpus[d].viol_ns[v] / 1e9);
         }
 
         if (gpus[0].has_energy) {
