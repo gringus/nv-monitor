@@ -3,3 +3,5 @@ nv-monitor-dbg
 test_meminfo
 *.o
 demo-load
+tests/test_meminfo
+tests/test_thermal
