@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-nv-monitor is a single-file C headless Prometheus exporter for the NVIDIA DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It exposes CPU, memory, GPU, NIC, RDMA, and thermal-zone metrics on an HTTP endpoint for Prometheus scraping. There is no TUI — the exporter is the only mode.
+nv-monitor is a single-file C headless Prometheus exporter for the NVIDIA DGX Spark (Grace ARM CPU + GB10 Blackwell GPU). It exposes CPU, memory, GPU (incl. throttle-reason durations and energy), disk capacity and I/O, network/NIC, RDMA, and thermal-zone metrics on an HTTP endpoint for Prometheus scraping. There is no TUI — the exporter is the only mode.
 
 ## Build
 
@@ -23,7 +23,7 @@ Works on both **aarch64** (DGX Spark) and **x86_64**. On x86 the per-core `type`
 
 ## Architecture
 
-Everything is in `nv-monitor.c` (~1450 lines). Key sections:
+Everything is in `nv-monitor.c` (~1500 lines); tests live in `tests/`. Key sections:
 
 - **NVML dynamic loading**: Loads `libnvidia-ml.so.1` via `dlopen`/`dlsym` at runtime. Uses a variadic LOAD macro to try versioned symbols first (e.g. `nvmlInit_v2` before `nvmlInit`). All NVML function pointers are prefixed with `p` (e.g. `pNvmlInit`).
 - **CPU sampling**: Reads `/proc/stat` delta between consecutive scrapes to compute per-core usage percentages.
@@ -40,7 +40,7 @@ All memory is allocated once at startup, sized to the detected hardware. **Zero 
 - Prometheus buffers are pre-allocated when the server thread starts
 - The `compute_cpu_usage()` and `format_metrics()` functions must NEVER call malloc/calloc/realloc
 
-If you need to add new data collection, allocate the buffer at startup alongside the existing arrays — not in the hot path. Run `./soak-test.sh 10` after any changes to verify RSS stability.
+If you need to add new data collection, allocate the buffer at startup alongside the existing arrays — not in the hot path. Run `./tests/soak-test.sh 10` after any changes to verify RSS stability.
 
 ## Locale / decimal separator (CRITICAL for Prometheus)
 

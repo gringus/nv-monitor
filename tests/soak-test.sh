@@ -5,10 +5,11 @@
 # Runs nv-monitor at maximum collection frequency while hammering the
 # Prometheus endpoint. Monitors RSS over time to detect memory growth.
 #
-# Usage: ./soak-test.sh [duration_minutes]
+# Usage: ./tests/soak-test.sh [duration_minutes]  (from repo root, or anywhere)
 #        Default: 10 minutes
 
 set -e
+cd "$(dirname "$0")/.." || exit 1   # run against repo root regardless of caller CWD
 
 DURATION_MIN=${1:-10}
 DURATION_SEC=$((DURATION_MIN * 60))

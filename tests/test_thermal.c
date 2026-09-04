@@ -12,7 +12,7 @@
 #define THERMAL_BASE    "/tmp/nvmon-tz-test"
 #define DISKSTATS_PATH  "/tmp/nvmon-diskstats-test"
 #define main            nv_monitor_main
-#include "nv-monitor.c"
+#include "../nv-monitor.c"
 #undef main
 
 static int tests_run = 0;

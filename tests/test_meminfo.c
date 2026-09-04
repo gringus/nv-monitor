@@ -1,7 +1,7 @@
 /*
  * Tests for meminfo_calc() — the derived memory calculation logic.
  *
- * Build & run: gcc -O0 -Wall -o test_meminfo test_meminfo.c && ./test_meminfo
+ * Build & run: make test
  */
 
 #include <stdio.h>

@@ -2,13 +2,13 @@
 #
 # bench.sh — Resource usage benchmark for nv-monitor vs top vs htop
 #
-# Run on the target device:
-#   chmod +x bench.sh
-#   ./bench.sh
+# Run on the target device (from anywhere):
+#   ./tests/bench.sh
 #
 # Outputs a summary to stdout. No files sent, just paste the results.
 
 set -e
+cd "$(dirname "$0")/.." || exit 1   # run against repo root regardless of caller CWD
 
 NV_MONITOR="./nv-monitor"
 DURATION=10

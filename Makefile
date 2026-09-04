@@ -17,13 +17,13 @@ demo-load: demo-load.c
 portable:
 	$(CC) $(CFLAGS_PORTABLE) -o $(TARGET) nv-monitor.c $(LDFLAGS)
 
-test: test_meminfo.c test_thermal.c
-	$(CC) -O0 -Wall -Wextra -o test_meminfo test_meminfo.c
-	./test_meminfo
+test: tests/test_meminfo.c tests/test_thermal.c
+	$(CC) -O0 -Wall -Wextra -o tests/test_meminfo tests/test_meminfo.c
+	./tests/test_meminfo
 	# -Wno-format-truncation: pre-existing snprintfs in nv-monitor.c trip the
 	# -O0-only analyzer; the release build (-O3 -flto) is warning-clean
-	$(CC) -O0 -Wall -Wextra -Wno-format-truncation -o test_thermal test_thermal.c $(LDFLAGS)
-	./test_thermal
+	$(CC) -O0 -Wall -Wextra -Wno-format-truncation -o tests/test_thermal tests/test_thermal.c $(LDFLAGS)
+	./tests/test_thermal
 
 lint:
 	@echo "Running cppcheck..."
@@ -32,7 +32,7 @@ lint:
 	clang-tidy-20 nv-monitor.c -- --std=gnu11 -ldl -lpthread -Wall -Wextra
 
 clean:
-	rm -f $(TARGET) demo-load test_meminfo test_thermal
+	rm -f $(TARGET) demo-load tests/test_meminfo tests/test_thermal
 
 install: $(TARGET)
 	install -d $(PREFIX)/bin

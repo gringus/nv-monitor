@@ -87,7 +87,7 @@ static unsigned int gpu_count = 0;      /* number of GPUs detected */
 
 #define MAX_THERMAL_ZONES 20
 #ifndef THERMAL_BASE
-#define THERMAL_BASE      "/sys/class/thermal" /* test_thermal.c redefines this before including nv-monitor.c */
+#define THERMAL_BASE      "/sys/class/thermal" /* tests/test_thermal.c redefines this before including nv-monitor.c */
 #endif
 
 /* ── CPU state (dynamically allocated at startup) ──────────────────── */
@@ -488,7 +488,7 @@ static int read_nic_asic_temp(void) {
 
 #define MAX_NET_DEVS 32
 #ifndef NETDEV_PATH
-#define NETDEV_PATH "/proc/net/dev" /* test_thermal.c redefines this */
+#define NETDEV_PATH "/proc/net/dev" /* tests/test_thermal.c redefines this */
 #endif
 
 typedef struct {
@@ -546,7 +546,7 @@ static int read_net_devices(NetDev *devs, int max) {
 
 #define MAX_DISK_DEVS 32
 #ifndef DISKSTATS_PATH
-#define DISKSTATS_PATH "/proc/diskstats" /* test_thermal.c redefines this */
+#define DISKSTATS_PATH "/proc/diskstats" /* tests/test_thermal.c redefines this */
 #endif
 
 typedef struct {
