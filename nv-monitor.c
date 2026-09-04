@@ -1124,10 +1124,15 @@ static int format_metrics(char *buf, int buflen) {
         for (int d = 0; d < n_gpus; d++)
             PM("nv_gpu_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_gpu);
 
-        PM("# HELP nv_gpu_memory_utilization_percent GPU memory controller utilization\n"
-           "# TYPE nv_gpu_memory_utilization_percent gauge\n");
-        for (int d = 0; d < n_gpus; d++)
-            PM("nv_gpu_memory_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_mem);
+        /* Meaningless on unified-memory parts (always 0) — omit like gpu_memory_*,
+         * which is detected via GetMemoryInfo failing with NOT_SUPPORTED */
+        if (gpus[0].has_mem) {
+            PM("# HELP nv_gpu_memory_utilization_percent GPU memory controller utilization\n"
+               "# TYPE nv_gpu_memory_utilization_percent gauge\n");
+            for (int d = 0; d < n_gpus; d++)
+                if (gpus[d].has_mem)
+                    PM("nv_gpu_memory_utilization_percent{gpu=\"%d\"} %u\n", d, gpus[d].util_mem);
+        }
 
         PM("# HELP nv_gpu_temperature_celsius GPU temperature\n"
            "# TYPE nv_gpu_temperature_celsius gauge\n");

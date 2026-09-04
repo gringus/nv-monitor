@@ -85,7 +85,7 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_disk_read_bytes_total`, `nv_disk_written_bytes_total` | counter | `device` | Throughput bytes per physical disk |
 | `nv_gpu_info` | gauge | `gpu`, `name`, `uuid` | GPU identity (uuid omitted where unsupported, e.g. Jetson) |
 | `nv_gpu_utilization_percent` | gauge | `gpu` | GPU compute utilization |
-| `nv_gpu_memory_utilization_percent` | gauge | `gpu` | GPU memory controller utilization (reads 0 on unified memory) |
+| `nv_gpu_memory_utilization_percent` | gauge | `gpu` | GPU memory controller utilization (omitted on unified memory) |
 | `nv_gpu_temperature_celsius` | gauge | `gpu` | GPU temperature |
 | `nv_gpu_power_watts` | gauge | `gpu` | GPU power draw |
 | `nv_gpu_clock_mhz` | gauge | `gpu`, `type` | GPU clock speed (graphics, memory) |
