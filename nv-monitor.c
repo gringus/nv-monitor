@@ -46,11 +46,38 @@ typedef struct {
 } nvmlMemory_t;
 
 /* Cumulative clock-limit violation time (nvmlPerfPolicyType 0..5);
- * violationTime in nanoseconds. DEPRECATED in NVML 13 — probes degrade to absent. */
+ * violationTime in nanoseconds. DEPRECATED in NVML 13, removed in CUDA 14 —
+ * fallback for drivers without nvmlDeviceGetFieldValues support here. */
 typedef struct {
     unsigned long long referenceTime;
     unsigned long long violationTime;
 } nvmlViolationTime_t;
+
+/* nvmlDeviceGetTemperatureV in/out struct (replacement for GetTemperature) */
+typedef struct {
+    unsigned int version;
+    int sensorType;
+    int temperature;
+} nvmlTemperature_v1_t;
+#define NVML_TEMPERATURE_VER 0x100000CU  /* (1<<24)|sizeof */
+
+/* nvmlDeviceGetFieldValues entry (unversioned struct) */
+typedef struct {
+    unsigned int fieldId;
+    unsigned int scopeId;
+    long long    timestamp;
+    long long    latencyUsec;
+    int          valueType;
+    int          nvmlReturn;
+    union { double dVal; unsigned long long ullVal; } value;
+} nvmlFieldValue_t;
+
+/* Field IDs for nv_gpu_throttle_duration_seconds_total, in viol_reasons[] order.
+ * 74/76/77/78/79 are the long-standing NVML_FI_DEV_PERF_POLICY_* counters (docs
+ * now alias POWER/SYNC_BOOST to CLOCKS_EVENT_REASON_SW_POWER_CAP/_SYNC_BOOST);
+ * 269 = NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_THERM_SLOWDOWN, the replacement for
+ * the retired THERMAL policy. All counters in ns. */
+static const unsigned int viol_field_ids[6] = { 74, 269, 76, 77, 78, 79 };
 
 #define NVML_SUCCESS 0
 #define NVML_TEMPERATURE_GPU 0
@@ -65,6 +92,7 @@ static nvmlReturn_t (*pNvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t *)
 static nvmlReturn_t (*pNvmlDeviceGetName)(nvmlDevice_t, char *, unsigned int);
 static nvmlReturn_t (*pNvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t *);
 static nvmlReturn_t (*pNvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t *);
+static nvmlReturn_t (*pNvmlDeviceGetTemperatureV)(nvmlDevice_t, nvmlTemperature_v1_t *);
 static nvmlReturn_t (*pNvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int *);
@@ -72,12 +100,13 @@ static nvmlReturn_t (*pNvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int *, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetPerformanceState)(nvmlDevice_t, int *);
-static nvmlReturn_t (*pNvmlDeviceGetCurrClocksThrottleReasons)(nvmlDevice_t, unsigned long long *);
+static nvmlReturn_t (*pNvmlDeviceGetCurrentClocksEventReasons)(nvmlDevice_t, unsigned long long *);
 static nvmlReturn_t (*pNvmlDeviceGetTotalEnergyConsumption)(nvmlDevice_t, unsigned long long *);
 static nvmlReturn_t (*pNvmlDeviceGetPcieReplayCounter)(nvmlDevice_t, unsigned int *);
 static nvmlReturn_t (*pNvmlDeviceGetUUID)(nvmlDevice_t, char *, unsigned int);
 static nvmlReturn_t (*pNvmlSystemGetDriverVersion)(char *, unsigned int);
 static nvmlReturn_t (*pNvmlDeviceGetViolationStatus)(nvmlDevice_t, int, nvmlViolationTime_t *);
+static nvmlReturn_t (*pNvmlDeviceGetFieldValues)(nvmlDevice_t, int, nvmlFieldValue_t *);
 
 static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
@@ -153,6 +182,7 @@ static int load_nvml(void) {
     LOAD(pNvmlDeviceGetName,                      "nvmlDeviceGetName");
     LOAD(pNvmlDeviceGetUtilizationRates,          "nvmlDeviceGetUtilizationRates");
     LOAD(pNvmlDeviceGetMemoryInfo,                "nvmlDeviceGetMemoryInfo");
+    LOAD(pNvmlDeviceGetTemperatureV,              "nvmlDeviceGetTemperatureV");
     LOAD(pNvmlDeviceGetTemperature,               "nvmlDeviceGetTemperature");
     LOAD(pNvmlDeviceGetPowerUsage,                "nvmlDeviceGetPowerUsage");
     LOAD(pNvmlDeviceGetClockInfo,                 "nvmlDeviceGetClockInfo");
@@ -160,14 +190,17 @@ static int load_nvml(void) {
     LOAD(pNvmlDeviceGetEncoderUtilization,        "nvmlDeviceGetEncoderUtilization");
     LOAD(pNvmlDeviceGetDecoderUtilization,        "nvmlDeviceGetDecoderUtilization");
     LOAD(pNvmlDeviceGetPerformanceState,          "nvmlDeviceGetPerformanceState");
-    /* GB10's NVML dropped the *Curr* symbols; *Current* is the modern name */
-    LOAD(pNvmlDeviceGetCurrClocksThrottleReasons, "nvmlDeviceGetCurrentClocksThrottleReasons",
+    /* Event reasons replaced the *ThrottleReasons* family (same bit values);
+     * the *Curr* spellings only exist on pre-GH200-era drivers */
+    LOAD(pNvmlDeviceGetCurrentClocksEventReasons, "nvmlDeviceGetCurrentClocksEventReasons",
+        "nvmlDeviceGetCurrentClocksThrottleReasons",
         "nvmlDeviceGetCurrClocksThrottleReasons_v2", "nvmlDeviceGetCurrClocksThrottleReasons");
     LOAD(pNvmlDeviceGetTotalEnergyConsumption,    "nvmlDeviceGetTotalEnergyConsumption");
     LOAD(pNvmlDeviceGetPcieReplayCounter,         "nvmlDeviceGetPcieReplayCounter");
     LOAD(pNvmlDeviceGetUUID,                      "nvmlDeviceGetUUID_v2", "nvmlDeviceGetUUID");
     LOAD(pNvmlSystemGetDriverVersion,             "nvmlSystemGetDriverVersion_v2", "nvmlSystemGetDriverVersion");
     LOAD(pNvmlDeviceGetViolationStatus,           "nvmlDeviceGetViolationStatus");
+    LOAD(pNvmlDeviceGetFieldValues,               "nvmlDeviceGetFieldValues");
     #undef LOAD
 
     if (!pNvmlInit) return -1;
@@ -1066,20 +1099,34 @@ static int format_metrics(char *buf, int buflen) {
                     g->util_gpu = util.gpu;
                     g->util_mem = util.memory;
                 }
-                if (pNvmlDeviceGetTemperature)
+                if (pNvmlDeviceGetTemperatureV) {
+                    nvmlTemperature_v1_t tv = { NVML_TEMPERATURE_VER, NVML_TEMPERATURE_GPU, 0 };
+                    if (pNvmlDeviceGetTemperatureV(dev, &tv) == NVML_SUCCESS)
+                        g->temp = (unsigned int)tv.temperature;
+                } else if (pNvmlDeviceGetTemperature)
                     pNvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &g->temp);
                 /* Optional per-platform counters (GB10: throttle yes, energy no) */
                 int ps;
                 g->has_pstate = (pNvmlDeviceGetPerformanceState &&
                                  pNvmlDeviceGetPerformanceState(dev, &ps) == NVML_SUCCESS);
                 if (g->has_pstate) g->pstate = (unsigned int)ps;
-                g->has_throttle = (pNvmlDeviceGetCurrClocksThrottleReasons &&
-                                   pNvmlDeviceGetCurrClocksThrottleReasons(dev, &g->throttle) == NVML_SUCCESS);
+                g->has_throttle = (pNvmlDeviceGetCurrentClocksEventReasons &&
+                                   pNvmlDeviceGetCurrentClocksEventReasons(dev, &g->throttle) == NVML_SUCCESS);
                 g->has_energy = (pNvmlDeviceGetTotalEnergyConsumption &&
                                  pNvmlDeviceGetTotalEnergyConsumption(dev, &g->energy_mj) == NVML_SUCCESS);
                 g->has_replay = (pNvmlDeviceGetPcieReplayCounter &&
                                  pNvmlDeviceGetPcieReplayCounter(dev, &g->replay) == NVML_SUCCESS);
-                if (pNvmlDeviceGetViolationStatus) {
+                if (pNvmlDeviceGetFieldValues) {
+                    /* One batched query for all six duration counters */
+                    nvmlFieldValue_t fv[6];
+                    for (int v = 0; v < 6; v++) { fv[v] = (nvmlFieldValue_t){0}; fv[v].fieldId = viol_field_ids[v]; }
+                    if (pNvmlDeviceGetFieldValues(dev, 6, fv) == NVML_SUCCESS)
+                        for (int v = 0; v < 6; v++)
+                            if (fv[v].nvmlReturn == NVML_SUCCESS) {
+                                g->has_viol[v] = 1; g->viol_ns[v] = fv[v].value.ullVal;
+                            }
+                } else if (pNvmlDeviceGetViolationStatus) {
+                    /* pre-field-values drivers only */
                     for (int v = 0; v < 6; v++) {
                         nvmlViolationTime_t vt = {0};
                         g->has_viol[v] = (pNvmlDeviceGetViolationStatus(dev, v, &vt) == NVML_SUCCESS);
