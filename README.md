@@ -88,7 +88,9 @@ curl -s localhost:9101/metrics     # Check it works
 | `nv_gpu_memory_utilization_percent` | gauge | `gpu` | GPU memory controller utilization (omitted on unified memory) |
 | `nv_gpu_temperature_celsius` | gauge | `gpu` | GPU temperature |
 | `nv_gpu_power_watts` | gauge | `gpu` | GPU power draw |
-| `nv_gpu_clock_mhz` | gauge | `gpu`, `type` | GPU clock speed (graphics, memory) |
+| `nv_gpu_clock_mhz` | gauge | `gpu`, `type` | GPU clock speed (graphics, sm, memory, video) |
+| `nv_gpu_clock_max_mhz` | gauge | `gpu`, `type` | Clock ceiling (graphics, sm, video) |
+| `nv_gpu_process_memory_bytes` | gauge | `gpu`, `name` | GPU memory used per compute process, summed across processes sharing a name (`nvidia-smi` Processes) |
 | `nv_gpu_memory_total_bytes` | gauge | `gpu` | GPU memory total (omitted on unified-memory GB10) |
 | `nv_gpu_memory_used_bytes` | gauge | `gpu` | GPU memory used (omitted on unified-memory GB10) |
 | `nv_gpu_fan_speed_percent` | gauge | `gpu` | Fan speed |

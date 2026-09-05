@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <signal.h>
@@ -79,10 +81,26 @@ typedef struct {
  * the retired THERMAL policy. All counters in ns. */
 static const unsigned int viol_field_ids[6] = { 74, 269, 76, 77, 78, 79 };
 
+/* Compute process entry (nvmlProcessInfo v2/v3 layout — v1 is shorter and
+ * must NOT be used with these array pointers) */
+typedef struct {
+    unsigned int pid;
+    unsigned long long usedGpuMemory;
+    unsigned int gpuInstanceId;
+    unsigned int computeInstanceId;
+} nvmlProcessInfo_t;
+
 #define NVML_SUCCESS 0
 #define NVML_TEMPERATURE_GPU 0
 #define NVML_CLOCK_GRAPHICS 0
+#define NVML_CLOCK_SM 1
 #define NVML_CLOCK_MEM 2
+#define NVML_CLOCK_VIDEO 3
+
+/* Hard cap on compute processes per GPU (raw and after name-aggregation);
+ * beyond it the metric goes absent for that scrape (a GB10 realistically
+ * runs tens of compute processes) */
+#define MAX_GPU_PROCS 128
 
 /* NVML function pointers */
 static nvmlReturn_t (*pNvmlInit)(void);
@@ -107,6 +125,8 @@ static nvmlReturn_t (*pNvmlDeviceGetUUID)(nvmlDevice_t, char *, unsigned int);
 static nvmlReturn_t (*pNvmlSystemGetDriverVersion)(char *, unsigned int);
 static nvmlReturn_t (*pNvmlDeviceGetViolationStatus)(nvmlDevice_t, int, nvmlViolationTime_t *);
 static nvmlReturn_t (*pNvmlDeviceGetFieldValues)(nvmlDevice_t, int, nvmlFieldValue_t *);
+static nvmlReturn_t (*pNvmlDeviceGetMaxClockInfo)(nvmlDevice_t, int, unsigned int *);
+static nvmlReturn_t (*pNvmlDeviceGetComputeRunningProcesses)(nvmlDevice_t, unsigned int *, nvmlProcessInfo_t *);
 
 static void *nvml_handle = NULL;
 static int   nvml_ok = 0;
@@ -201,6 +221,10 @@ static int load_nvml(void) {
     LOAD(pNvmlSystemGetDriverVersion,             "nvmlSystemGetDriverVersion_v2", "nvmlSystemGetDriverVersion");
     LOAD(pNvmlDeviceGetViolationStatus,           "nvmlDeviceGetViolationStatus");
     LOAD(pNvmlDeviceGetFieldValues,               "nvmlDeviceGetFieldValues");
+    LOAD(pNvmlDeviceGetMaxClockInfo,              "nvmlDeviceGetMaxClockInfo");
+    /* v1 has a shorter struct than v2/v3 — do not chain it, would misstride the array */
+    LOAD(pNvmlDeviceGetComputeRunningProcesses,   "nvmlDeviceGetComputeRunningProcesses_v3",
+        "nvmlDeviceGetComputeRunningProcesses_v2");
     #undef LOAD
 
     if (!pNvmlInit) return -1;
@@ -814,7 +838,34 @@ typedef struct {
     int      has_replay;
     unsigned long long viol_ns[6]; /* per nvmlPerfPolicyType 0..5 */
     int      has_viol[6];
+    unsigned int clk_max_gfx, clk_max_sm, clk_max_video;
+    unsigned int clk_sm, clk_video;
+    /* Aggregated by process name (pid would churn series); colliding names
+     * sum together — cardinality is bounded by distinct argv[0] strings */
+    unsigned long long proc_mem[MAX_GPU_PROCS];
+    char     proc_name[MAX_GPU_PROCS][64];
+    int      n_procs;              /* 0 = metric absent this scrape */
 } PromGpu;
+
+/* Sanitized argv[0] of a process for the name= label (mirrors what
+ * nvidia-smi shows). Fixed-size buffers — no allocation. */
+static void gpu_proc_name(unsigned int pid, char *out, size_t cap)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%u/cmdline", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    char raw[256];
+    ssize_t n = fd >= 0 ? read(fd, raw, sizeof(raw) - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0) { snprintf(out, cap, "(gone)"); return; }
+    raw[n] = 0;                      /* argv[0] ends at first NUL */
+    size_t j = 0;
+    for (size_t i = 0; raw[i] && j + 1 < cap; i++) {
+        unsigned char c = raw[i];
+        out[j++] = (isalnum(c) || c == '.' || c == '_' || c == ':' || c == '-' || c == '/') ? c : '_';
+    }
+    out[j] = 0;
+}
 
 /* Label names for nvmlPerfPolicyType 0..5 (policy indices are the array order) */
 static const char *const viol_reasons[6] = {
@@ -1141,6 +1192,32 @@ static int format_metrics(char *buf, int buflen) {
             if (pNvmlDeviceGetClockInfo) {
                 pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS, &g->clk_gfx);
                 pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_MEM, &g->clk_mem);
+                pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &g->clk_sm);
+                pNvmlDeviceGetClockInfo(dev, NVML_CLOCK_VIDEO, &g->clk_video);
+            }
+            if (pNvmlDeviceGetMaxClockInfo) {
+                pNvmlDeviceGetMaxClockInfo(dev, NVML_CLOCK_GRAPHICS, &g->clk_max_gfx);
+                pNvmlDeviceGetMaxClockInfo(dev, NVML_CLOCK_SM, &g->clk_max_sm);
+                pNvmlDeviceGetMaxClockInfo(dev, NVML_CLOCK_VIDEO, &g->clk_max_video);
+            }
+            /* Compute processes: one NVML call into a fixed array */
+            g->n_procs = 0;
+            if (pNvmlDeviceGetComputeRunningProcesses) {
+                nvmlProcessInfo_t pi[MAX_GPU_PROCS];
+                unsigned int n = MAX_GPU_PROCS;
+                if (pNvmlDeviceGetComputeRunningProcesses(dev, &n, pi) == NVML_SUCCESS) {
+                    for (unsigned int i = 0; i < n; i++) {
+                        char nm[64];
+                        gpu_proc_name(pi[i].pid, nm, sizeof(nm));
+                        int j = 0;
+                        while (j < g->n_procs && strcmp(g->proc_name[j], nm) != 0) j++;
+                        if (j == g->n_procs && g->n_procs < MAX_GPU_PROCS) {
+                            memcpy(g->proc_name[g->n_procs], nm, sizeof(nm));
+                            g->n_procs++;
+                        }
+                        if (j < g->n_procs) g->proc_mem[j] += pi[i].usedGpuMemory;
+                    }
+                }
             }
 
             nvmlMemory_t mem = {0};
@@ -1192,6 +1269,24 @@ static int format_metrics(char *buf, int buflen) {
             if (gpus[d].has_power)
                 PM("nv_gpu_power_watts{gpu=\"%d\"} %.1f\n", d, gpus[d].power_mw / 1000.0);
 
+        PM("# HELP nv_gpu_clock_max_mhz GPU clock speed ceiling\n"
+           "# TYPE nv_gpu_clock_max_mhz gauge\n");
+        for (int d = 0; d < n_gpus; d++) {
+            if (gpus[d].clk_max_gfx)
+                PM("nv_gpu_clock_max_mhz{gpu=\"%d\",type=\"graphics\"} %u\n", d, gpus[d].clk_max_gfx);
+            if (gpus[d].clk_max_sm)
+                PM("nv_gpu_clock_max_mhz{gpu=\"%d\",type=\"sm\"} %u\n", d, gpus[d].clk_max_sm);
+            if (gpus[d].clk_max_video)
+                PM("nv_gpu_clock_max_mhz{gpu=\"%d\",type=\"video\"} %u\n", d, gpus[d].clk_max_video);
+        }
+
+        PM("# HELP nv_gpu_process_memory_bytes GPU memory used per compute process (summed across processes sharing a name)\n"
+           "# TYPE nv_gpu_process_memory_bytes gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int i = 0; i < gpus[d].n_procs; i++)
+                PM("nv_gpu_process_memory_bytes{gpu=\"%d\",name=\"%s\"} %llu\n",
+                   d, gpus[d].proc_name[i], gpus[d].proc_mem[i]);
+
         PM("# HELP nv_gpu_clock_mhz GPU clock speed\n"
            "# TYPE nv_gpu_clock_mhz gauge\n");
         for (int d = 0; d < n_gpus; d++) {
@@ -1199,6 +1294,10 @@ static int format_metrics(char *buf, int buflen) {
                 PM("nv_gpu_clock_mhz{gpu=\"%d\",type=\"graphics\"} %u\n", d, gpus[d].clk_gfx);
             if (gpus[d].clk_mem)
                 PM("nv_gpu_clock_mhz{gpu=\"%d\",type=\"memory\"} %u\n", d, gpus[d].clk_mem);
+            if (gpus[d].clk_sm)
+                PM("nv_gpu_clock_mhz{gpu=\"%d\",type=\"sm\"} %u\n", d, gpus[d].clk_sm);
+            if (gpus[d].clk_video)
+                PM("nv_gpu_clock_mhz{gpu=\"%d\",type=\"video\"} %u\n", d, gpus[d].clk_video);
         }
 
         PM("# HELP nv_gpu_memory_total_bytes GPU memory total\n"
